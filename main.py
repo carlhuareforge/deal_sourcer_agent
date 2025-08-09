@@ -607,6 +607,15 @@ async def process_username(username, is_new_username, following_counts):
 
         filtered_followings = []
         for user in limited_followings:
+            screen_name = user.get('screen_name')
+            
+            # FIRST CHECK: Have we seen this profile before?
+            dedup_check = await DeduplicationService.process_profile(screen_name, username)
+            if not dedup_check['isNew']:
+                logger.log(f"    Skip @{screen_name} - Already processed (duplicate)")
+                continue  # Skip to next user
+            
+            # Only proceed with filtering if this is a new profile
             follower_count = user.get('followers_count', 0)
             following_count = user.get('friends_count', 0)
             created_at_str = user.get('created_at')
@@ -628,11 +637,24 @@ async def process_username(username, is_new_username, following_counts):
 
             is_new_account = account_age <= 90  # Changed from MAX_ACCOUNT_AGE_DAYS to 90
             
-            # REMOVED FILTERING LOGIC - Include ALL profiles regardless of follower/following counts or age
-            logger.log(f"    Include @{user.get('screen_name')} (Followers: {follower_count}, Following: {following_count}, Age: {account_age} days)")
+            # Apply filtering logic: Skip if (followers > 1000 AND following > 1000) AND old account
+            # Keep if: new account OR (followers <= 1000 OR following <= 1000)
+            should_skip = not is_new_account and (follower_count > 1000 and following_count > 1000)
             
-            # Add all users to filtered_followings (no filtering)
-            filtered_followings.append(user)
+            if should_skip:
+                logger.log(f"    Skip @{screen_name} (Followers: {follower_count}, Following: {following_count}, Age: {account_age} days) - Old account with high counts")
+                # Record this filtered profile so we don't check it again
+                await DeduplicationService.record_new_profile({
+                    "twitter_handle": screen_name,
+                    "notion_page_id": None
+                }, username)  # username is the source_username
+            else:
+                if is_new_account:
+                    logger.log(f"    Include @{screen_name} (Followers: {follower_count}, Following: {following_count}, Age: {account_age} days) - New account")
+                else:
+                    logger.log(f"    Include @{screen_name} (Followers: {follower_count}, Following: {following_count}, Age: {account_age} days) - Low counts")
+                # Only add to filtered_followings if it passes the filter
+                filtered_followings.append(user)
 
         new_followings = filtered_followings
         if not is_new_username and count_diff > 0:
@@ -684,38 +706,11 @@ async def collect_tweets_for_new_followers(new_followings, source_username):
             nonlocal processed_count, success_count, error_count, skipped_count
             processed_count += 1
             try:
-                follower_count = user.get('followers_count', 0)
-                following_count = user.get('friends_count', 0)
-                created_at_str = user.get('created_at')
-                
                 # Log basic user info for debugging
                 logger.log(f"Starting process for @{user.get('screen_name')} (ID: {user.get('id_str')})")
                 
-                account_age = 91  # Default to old account (> 90 days)
-                if created_at_str:
-                    try:
-                        created_at_dt = datetime.strptime(created_at_str, '%a %b %d %H:%M:%S %z %Y')
-                        now_est = datetime.now(pytz.timezone('America/New_York'))
-                        created_at_est = created_at_dt.astimezone(pytz.timezone('America/New_York'))
-                        time_diff = now_est - created_at_est
-                        account_age = time_diff.days
-                    except ValueError:
-                        logger.warn(f"Could not parse created_at date for @{user.get('screen_name')}: {created_at_str}")
-
-                is_new_account = account_age <= 90  # Changed from MAX_ACCOUNT_AGE_DAYS to 90
-                
-                # REMOVED FILTERING LOGIC - Process ALL profiles regardless of follower/following counts or age
-                logger.log(f"    {processed_count}/{len(new_followings)} ✅ @{user.get('screen_name')} (Followers: {follower_count}, Following: {following_count}, Age: {account_age} days) - Processing ALL profiles")
-
-                # Check if we already processed this user
-                deduplication_result = await DeduplicationService.process_profile(
-                    user.get('screen_name'),
-                    source_username
-                )
-                if not deduplication_result['isNew']:
-                    logger.log(f"    {processed_count}/{len(new_followings)} ❌ @{user.get('screen_name')} (Duplicate)")
-                    skipped_count += 1
-                    return { "user": user, "status": 'skipped', "reason": 'duplicate' }
+                # No need to filter or check duplicates - already done in process_username
+                logger.log(f"    {processed_count}/{len(new_followings)} Processing @{user.get('screen_name')}")
 
                 user_id = user.get('id_str')
                 if not user_id:
