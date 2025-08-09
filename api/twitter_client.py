@@ -56,7 +56,7 @@ async def make_http_request(options):
         loop = asyncio.get_event_loop()
         response = await loop.run_in_executor(
             None,
-            lambda: requests.request(method, url, params=params, headers=headers, json=data, timeout=10)
+            lambda: requests.request(method, url, params=params, headers=headers, json=data, timeout=30)
         )
         response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
         

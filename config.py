@@ -30,7 +30,7 @@ MAX_PROFILES = int(os.getenv('MAX_PROFILES', 75))
 # RapidAPI configuration
 RAPID_API_KEY = os.getenv('RAPID_API_KEY')
 RAPID_API_HOST = 'twitter135.p.rapidapi.com'
-RAPID_API_REQUESTS_PER_SECOND = int(os.getenv('RAPID_API_REQUESTS_PER_SECOND', 3))
+RAPID_API_REQUESTS_PER_SECOND = int(os.getenv('RAPID_API_REQUESTS_PER_SECOND', 5))  # Twitter API supports 5 req/sec
 RAPID_API_INTERVAL_MS = 1000 / RAPID_API_REQUESTS_PER_SECOND
 
 # OpenAI configuration

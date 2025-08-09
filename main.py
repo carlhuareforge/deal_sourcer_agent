@@ -479,7 +479,12 @@ async def get_following_counts(profiles):
                     logger.error(f"Error processing batch {i // batch_size + 1}: {error}")
                     retry_count += 1
                     if retry_count < max_retries:
-                        await asyncio.sleep(5) # Wait before retry
+                        # Increase wait time for timeout errors
+                        if "timeout" in str(error).lower():
+                            logger.log(f"Timeout error detected, waiting 10 seconds before retry...")
+                            await asyncio.sleep(10)
+                        else:
+                            await asyncio.sleep(5) # Wait before retry
             
             if not success:
                 for uid in batch_ids:
@@ -637,24 +642,30 @@ async def process_username(username, is_new_username, following_counts):
 
             is_new_account = account_age <= 90  # Changed from MAX_ACCOUNT_AGE_DAYS to 90
             
-            # Apply filtering logic: Skip if (followers > 1000 AND following > 1000) AND old account
-            # Keep if: new account OR (followers <= 1000 OR following <= 1000)
-            should_skip = not is_new_account and (follower_count > 1000 and following_count > 1000)
+            # Determine if we should process this profile
+            # Process if EITHER condition is true:
+            # 1. Both follower and following < 1000
+            # 2. New account (≤90 days old)
+            should_process = (
+                (follower_count < 1000 and following_count < 1000) or
+                is_new_account
+            )
             
-            if should_skip:
-                logger.log(f"    Skip @{screen_name} (Followers: {follower_count}, Following: {following_count}, Age: {account_age} days) - Old account with high counts")
+            if should_process:
+                # We want to process this profile
+                if is_new_account:
+                    logger.log(f"    Include @{screen_name} (Followers: {follower_count}, Following: {following_count}, Age: {account_age} days) - New account")
+                else:
+                    logger.log(f"    Include @{screen_name} (Followers: {follower_count}, Following: {following_count}, Age: {account_age} days) - Both Follower/Following < 1000")
+                filtered_followings.append(user)
+            else:
+                # Skip this profile but record it in deduplication
+                logger.log(f"    Skip @{screen_name} (Followers: {follower_count}, Following: {following_count}, Age: {account_age} days) - Old account or high counts")
                 # Record this filtered profile so we don't check it again
                 await DeduplicationService.record_new_profile({
                     "twitter_handle": screen_name,
                     "notion_page_id": None
                 }, username)  # username is the source_username
-            else:
-                if is_new_account:
-                    logger.log(f"    Include @{screen_name} (Followers: {follower_count}, Following: {following_count}, Age: {account_age} days) - New account")
-                else:
-                    logger.log(f"    Include @{screen_name} (Followers: {follower_count}, Following: {following_count}, Age: {account_age} days) - Low counts")
-                # Only add to filtered_followings if it passes the filter
-                filtered_followings.append(user)
 
         new_followings = filtered_followings
         if not is_new_username and count_diff > 0:
