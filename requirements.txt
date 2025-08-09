@@ -1,0 +1,8 @@
+python-dotenv
+requests
+openai
+pytz
+pytest
+pytest-asyncio
+pyfakefs
+tzdata
