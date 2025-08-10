@@ -79,7 +79,10 @@ Your task:
    - Fan accounts, unofficial community accounts, or parody accounts
    - If at any point in your research you discover that the project is **not a typical investable startup**, you should not continue with full research. For example, if it turns out to be:  
    - A media or marketing account, or generally not a product/project (e.g., just a crypto news outlet or a personality’s account).  
-   - A non-profit foundation, Association or an open-source hobby project with no company behind it (unless the task is explicitly to research such a thing, but usually we focus on venture-backable projects).   - An “association” or community fan account rather than the core project (e.g., a regional community for the project, not the project itself).   
+   - A foundation, Association or an open-source hobby project with no company behind it (unless the task is explicitly to research such a thing, but usually we focus on venture-backable projects).   - An “association” or community fan account rather than the core project (e.g., a regional community for the project, not the project itself).   
+   - If name contains: "Foundation", "Institute", "Association", "Council", "Alliance", "Organization", "Org"
+   - Name contains: "[Country] Community", "Unofficial", regional identifiers
+   - Bio mentions: "community managed", "fan account", "local chapter"
 
 4. **SPECIAL HANDLING FOR LIMITED INFORMATION (Hidden Gems)**
    For accounts with very few tweets or minimal information:
