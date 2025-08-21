@@ -67,3 +67,9 @@ EMAIL_SMTP_PORT = int(os.getenv('EMAIL_SMTP_PORT', 587))
 
 # Recovery file
 RECOVERY_FILE = os.path.join(BASE_DIR, 'recovery_state.json')
+
+# S3 Configuration for database sync
+USE_S3_SYNC = os.getenv('USE_S3_SYNC', 'True').lower() == 'true'
+S3_BUCKET = os.getenv('S3_BUCKET', '')
+S3_DB_KEY = os.getenv('S3_DB_KEY', 'twitter_profiles.db')
+S3_REGION = os.getenv('S3_REGION', 'us-east-1')

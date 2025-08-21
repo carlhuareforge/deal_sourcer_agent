@@ -19,7 +19,8 @@ from config import (
     MAX_PROFILES, RAPID_API_KEY, RAPID_API_HOST, RAPID_API_REQUESTS_PER_SECOND,
     OPENAI_API_KEY, OPENAI_MAX_RETRIES, OPENAI_TIMEOUT_MS, OPENAI_REQUESTS_PER_MINUTE,
     OPENAI_MODEL, MAX_FOLLOWERS, MAX_FOLLOWING, MAX_ACCOUNT_AGE_DAYS,
-    MAX_CONCURRENT_REQUESTS, CONCURRENT_PROCESSES, DEBUG_MODE, RECOVERY_FILE
+    MAX_CONCURRENT_REQUESTS, CONCURRENT_PROCESSES, DEBUG_MODE, RECOVERY_FILE,
+    USE_S3_SYNC
 )
 
 from api.twitter_client import TwitterClient, throttled_rapid_api_request
@@ -27,6 +28,7 @@ from api.twitter_parser import simplify_twitter_data, extract_tweets_from_respon
 from api.notion_client import initialize_notion_categories, get_existing_categories, add_notion_database_entry
 from api.openai_client import get_openai_client, create_throttler
 from services.deduplication_service import DeduplicationService
+from db.s3_sync import S3DatabaseSync
 # from services.email_service import send_completion_email  # Email functionality disabled
 
 # Initialize clients
@@ -1058,8 +1060,20 @@ async def main():
     total_uploaded = 0
     resume_mode = False
     processed_files = []
+    s3_sync = None
 
     await setup_directories()
+    
+    # Download latest database from S3 if enabled
+    if USE_S3_SYNC:
+        try:
+            logger.log("🔄 S3 sync enabled - downloading latest database from S3...")
+            s3_sync = S3DatabaseSync()
+            await s3_sync.download_latest()
+        except Exception as e:
+            logger.error(f"Failed to initialize S3 sync: {e}")
+            # Continue without S3 sync if it fails
+            s3_sync = None
     
     # Check for recovery marker file
     try:
@@ -1278,6 +1292,16 @@ async def main():
         logger.log(f"Upload Rate: {upload_rate:.1f}%")
         logger.log(f"Skip Rate: {skip_rate:.1f}%")
     logger.log(f"───────────────────────────────────────\n")
+    
+    # Upload updated database to S3 if enabled and run completed successfully
+    if USE_S3_SYNC and s3_sync:
+        try:
+            logger.log("🔄 Uploading updated database to S3...")
+            await s3_sync.upload_changes()
+            logger.log("✅ Database successfully synced to S3")
+        except Exception as e:
+            logger.error(f"Failed to upload database to S3: {e}")
+            # Don't fail the entire run if S3 upload fails
     
     return {
         "totalProcessed": total_processed,
