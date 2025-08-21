@@ -12,7 +12,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # File paths
 INPUT_FILE = os.path.join(BASE_DIR, 'input_usernames.csv')
-HISTORY_DIR = os.path.join(BASE_DIR, 'following_history')
+# HISTORY_DIR = os.path.join(BASE_DIR, 'following_history')  # REMOVED: Legacy, not needed
 OUTPUT_DIR = os.path.join(BASE_DIR, 'new_following')
 TWEETS_DIR = os.path.join(BASE_DIR, 'follower_tweets')
 INPUT_HISTORY_DIR = os.path.join(BASE_DIR, 'input_history')

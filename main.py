@@ -14,7 +14,7 @@ import openai  # For OpenAI exception handling
 
 from utils.logger import logger
 from config import (
-    INPUT_FILE, HISTORY_DIR, OUTPUT_DIR, TWEETS_DIR, INPUT_HISTORY_DIR,
+    INPUT_FILE, OUTPUT_DIR, TWEETS_DIR, INPUT_HISTORY_DIR,
     PROMPTS_DIR, FOLLOWER_COUNTS_DIR, LOGS_DIR, RAW_RESPONSES_DIR, AI_TWEETS_DIR,
     MAX_PROFILES, RAPID_API_KEY, RAPID_API_HOST, RAPID_API_REQUESTS_PER_SECOND,
     OPENAI_API_KEY, OPENAI_MAX_RETRIES, OPENAI_TIMEOUT_MS, OPENAI_REQUESTS_PER_MINUTE,
@@ -49,7 +49,7 @@ async def setup_directories():
     """
     Initializes all necessary directories.
     """
-    for directory in [HISTORY_DIR, OUTPUT_DIR, TWEETS_DIR, INPUT_HISTORY_DIR,
+    for directory in [OUTPUT_DIR, TWEETS_DIR, INPUT_HISTORY_DIR,
                        FOLLOWER_COUNTS_DIR, LOGS_DIR, RAW_RESPONSES_DIR, AI_TWEETS_DIR]:
         os.makedirs(directory, exist_ok=True)
     logger.log("All necessary directories ensured.")
@@ -669,19 +669,9 @@ async def process_username(username, is_new_username, following_counts):
                     "notion_page_id": None
                 }, username)  # username is the source_username
 
+        # Note: We already deduplicate using the database (line 620)
+        # No need for file-based deduplication since following_history files are legacy
         new_followings = filtered_followings
-        if not is_new_username and count_diff > 0:
-            # If we had a real increase, we want to ensure these are truly new
-            previous_followings = await get_previous_followings(username)
-            if previous_followings:
-                prev_set = set(
-                    f.get('screen_name', '').lower() 
-                    for f in previous_followings 
-                    if isinstance(f, dict) and f.get('screen_name')
-                )
-                new_followings = [f for f in filtered_followings if f.get('screen_name', '').lower() not in prev_set]
-            else:
-                logger.log(f"Warning: Could not get previous followings for {username}")
 
         return {
             "total": current_count,
@@ -1005,48 +995,9 @@ async def save_follower_counts(count_map):
         logger.error(f'Error saving follower counts: {e}')
         return None
 
-async def get_previous_followings(username):
-    """
-    Get previous followings from history directory
-    """
-    try:
-        files = os.listdir(HISTORY_DIR)
-        if not files:
-            return []
-        
-        user_files = [f for f in files if f.startswith(f"{username}_")]
-        if not user_files:
-            return []
-        
-        latest_file = sorted(user_files, reverse=True)[0]
-        with open(os.path.join(HISTORY_DIR, latest_file), 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        
-        if isinstance(data, list):
-            return data
-        elif isinstance(data, dict) and 'users' in data and isinstance(data['users'], list):
-            return data['users']
-        else:
-            logger.log(f"Warning: Invalid data format in {latest_file}")
-            return []
-    except Exception as e:
-        logger.log(f"Error reading previous followings for {username}: {e}")
-        return []
-
-async def save_following_history(username, followings):
-    """
-    Save following history to JSON file
-    """
-    try:
-        date_str = datetime.now(pytz.timezone('America/New_York')).strftime('%Y-%m-%d')
-        filename = os.path.join(HISTORY_DIR, f"{username}_{date_str}.json")
-        
-        with open(filename, 'w', encoding='utf-8') as f:
-            json.dump({"users": followings, "timestamp": datetime.now().isoformat()}, f, indent=2)
-        
-        logger.log(f"Saved following history for {username} to {filename}")
-    except Exception as e:
-        logger.error(f"Error saving following history: {e}")
+# NOTE: Removed get_previous_followings and save_following_history functions
+# These were for file-based deduplication using following_history directory
+# We now use database-based deduplication which is superior
 
 async def main():
     global notion_categories, skipped_profiles # Declare intent to modify global lists
@@ -1064,12 +1015,16 @@ async def main():
 
     await setup_directories()
     
-    # Download latest database from S3 if enabled
+    # Initialize S3 sync and download if enabled
+    s3_sync = None
     if USE_S3_SYNC:
         try:
-            logger.log("🔄 S3 sync enabled - downloading latest database from S3...")
+            logger.log("🔄 S3 sync enabled - checking for updates...")
             s3_sync = S3DatabaseSync()
-            await s3_sync.download_latest()
+            # Smart download - only if S3 is newer
+            await s3_sync.smart_download()
+            # Download latest follower counts if we don't have them
+            await s3_sync.download_latest_counts()
         except Exception as e:
             logger.error(f"Failed to initialize S3 sync: {e}")
             # Continue without S3 sync if it fails
@@ -1293,14 +1248,19 @@ async def main():
         logger.log(f"Skip Rate: {skip_rate:.1f}%")
     logger.log(f"───────────────────────────────────────\n")
     
-    # Upload updated database to S3 if enabled and run completed successfully
+    # Upload updated database and follower counts to S3 if enabled and run completed successfully
     if USE_S3_SYNC and s3_sync:
         try:
             logger.log("🔄 Uploading updated database to S3...")
             await s3_sync.upload_changes()
             logger.log("✅ Database successfully synced to S3")
+            
+            # Also sync the newest follower counts file
+            logger.log("🔄 Syncing follower counts to S3...")
+            await s3_sync.sync_follower_counts()
+            logger.log("✅ Follower counts synced to S3")
         except Exception as e:
-            logger.error(f"Failed to upload database to S3: {e}")
+            logger.error(f"Failed to upload to S3: {e}")
             # Don't fail the entire run if S3 upload fails
     
     return {

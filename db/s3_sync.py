@@ -88,6 +88,44 @@ class S3DatabaseSync:
         
         return stats
     
+    async def smart_download(self):
+        """Only download from S3 if it's newer than local database"""
+        if not USE_S3_SYNC:
+            return
+            
+        try:
+            # Get local database timestamp if it exists
+            local_mtime = None
+            if os.path.exists(self.local_path):
+                local_mtime = os.path.getmtime(self.local_path)
+                local_mtime_str = datetime.fromtimestamp(local_mtime).strftime('%Y-%m-%d %H:%M:%S')
+                logger.log(f"📁 Local database last modified: {local_mtime_str}")
+            
+            # Get S3 object metadata
+            try:
+                s3_info = self.s3.head_object(Bucket=self.bucket, Key=self.key)
+                s3_mtime = s3_info['LastModified'].timestamp()
+                s3_mtime_str = s3_info['LastModified'].strftime('%Y-%m-%d %H:%M:%S UTC')
+                logger.log(f"☁️  S3 database last modified: {s3_mtime_str}")
+                
+                # Compare timestamps
+                if local_mtime and s3_mtime <= local_mtime:
+                    logger.log(f"✅ Local database is newer or same as S3, keeping local version")
+                    return
+                    
+                logger.log(f"📥 S3 database is newer, downloading...")
+                await self.download_latest()
+                
+            except ClientError as e:
+                if e.response['Error']['Code'] == '404':
+                    logger.log("No database in S3, using local database")
+                else:
+                    raise
+                    
+        except Exception as e:
+            logger.error(f"Error in smart download: {e}")
+            # Don't fail the whole process, continue with local DB
+            
     async def download_latest(self):
         """Download the latest database from S3 to local"""
         if not USE_S3_SYNC:
@@ -225,6 +263,96 @@ class S3DatabaseSync:
         except Exception as e:
             logger.error(f"Unexpected error uploading to S3: {e}")
             raise
+    
+    async def sync_follower_counts(self):
+        """Sync only the newest follower counts file to S3"""
+        if not USE_S3_SYNC:
+            return
+            
+        try:
+            from config import FOLLOWER_COUNTS_DIR
+            
+            if not os.path.exists(FOLLOWER_COUNTS_DIR):
+                logger.log("No follower counts directory found")
+                return
+                
+            # Find newest local file
+            files = os.listdir(FOLLOWER_COUNTS_DIR)
+            if not files:
+                logger.log("No follower counts files to sync")
+                return
+                
+            # Filter out backup files and find newest
+            count_files = [f for f in files if f.startswith('follower_counts_') and not f.startswith('backup_')]
+            if not count_files:
+                logger.log("No follower counts files found")
+                return
+                
+            newest_local = sorted(count_files, reverse=True)[0]
+            local_path = os.path.join(FOLLOWER_COUNTS_DIR, newest_local)
+            
+            # Upload to S3 with same filename (preserves dates)
+            s3_key = f"follower_counts/{newest_local}"
+            
+            # Check if this file already exists in S3
+            try:
+                self.s3.head_object(Bucket=self.bucket, Key=s3_key)
+                logger.log(f"Follower counts file {newest_local} already exists in S3")
+                return
+            except ClientError:
+                # File doesn't exist, proceed with upload
+                pass
+            
+            # Upload the file
+            logger.log(f"📤 Uploading follower counts: {newest_local}")
+            self.s3.upload_file(local_path, self.bucket, s3_key)
+            logger.log(f"✅ Uploaded {newest_local} to S3")
+            
+        except Exception as e:
+            logger.error(f"Error syncing follower counts: {e}")
+            # Don't fail the whole process
+    
+    async def download_latest_counts(self):
+        """Download the newest counts file from S3 if we don't have it"""
+        if not USE_S3_SYNC:
+            return
+            
+        try:
+            from config import FOLLOWER_COUNTS_DIR
+            
+            # Ensure directory exists
+            os.makedirs(FOLLOWER_COUNTS_DIR, exist_ok=True)
+            
+            # List all follower_counts files in S3
+            response = self.s3.list_objects_v2(
+                Bucket=self.bucket,
+                Prefix='follower_counts/follower_counts_'
+            )
+            
+            if not response.get('Contents'):
+                logger.log("No follower counts in S3")
+                return
+                
+            # Find newest by filename (dates in filename)
+            s3_files = [obj['Key'] for obj in response['Contents']]
+            newest_s3 = sorted(s3_files, reverse=True)[0]
+            
+            # Download only if we don't have it locally
+            local_filename = os.path.basename(newest_s3)
+            local_path = os.path.join(FOLLOWER_COUNTS_DIR, local_filename)
+            
+            if os.path.exists(local_path):
+                logger.log(f"Already have latest follower counts: {local_filename}")
+                return
+                
+            # Download the file
+            logger.log(f"📥 Downloading follower counts: {local_filename}")
+            self.s3.download_file(self.bucket, newest_s3, local_path)
+            logger.log(f"✅ Downloaded {local_filename} from S3")
+            
+        except Exception as e:
+            logger.error(f"Error downloading follower counts: {e}")
+            # Don't fail the whole process
     
     async def list_versions(self, limit=10):
         """List recent versions of the database in S3 (useful for debugging)"""
