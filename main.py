@@ -917,11 +917,15 @@ async def get_previous_follower_count(username):
     Read previous follower count from CSV files
     """
     try:
-        files = os.listdir(FOLLOWER_COUNTS_DIR)
-        if not files:
+        all_items = os.listdir(FOLLOWER_COUNTS_DIR)
+        # Filter to only CSV files that match the expected pattern
+        csv_files = [f for f in all_items if f.endswith('.csv') and f.startswith('follower_counts_')]
+        
+        if not csv_files:
             return None
         
-        sorted_files = sorted(files, reverse=True)
+        # Sort to get the most recent file
+        sorted_files = sorted(csv_files, reverse=True)
         previous_file = sorted_files[0]
         
         with open(os.path.join(FOLLOWER_COUNTS_DIR, previous_file), 'r', encoding='utf-8') as f:
@@ -962,10 +966,10 @@ async def save_follower_counts(count_map):
         filename = os.path.join(FOLLOWER_COUNTS_DIR, f"follower_counts_{date_time}.csv")
         
         # Create backup of previous file if it exists
-        files = os.listdir(FOLLOWER_COUNTS_DIR)
-        if files:
-            # Filter out backup files
-            non_backup_files = [f for f in files if not f.startswith('backup_')]
+        all_items = os.listdir(FOLLOWER_COUNTS_DIR)
+        if all_items:
+            # Filter to only CSV files and exclude backup files
+            non_backup_files = [f for f in all_items if f.endswith('.csv') and f.startswith('follower_counts_') and not f.startswith('backup_')]
             if non_backup_files:
                 sorted_files = sorted(non_backup_files, reverse=True)
                 previous_file = sorted_files[0]

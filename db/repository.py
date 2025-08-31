@@ -8,9 +8,36 @@ class Repository:
     def __init__(self, db_name="twitter_profiles.db"):
         os.makedirs(DB_DIR, exist_ok=True)
         self.db_path = os.path.join(DB_DIR, db_name)
-        self._initialize_db()
+        self._initialized = False
 
+    def _ensure_initialized(self):
+        """Ensure database is initialized before any operation"""
+        if not self._initialized:
+            self._initialize_db()
+            self._initialized = True
+    
     def _initialize_db(self):
+        # Check if database already exists
+        db_exists = os.path.exists(self.db_path)
+        
+        if db_exists:
+            # Database exists, just verify it's valid
+            try:
+                conn = sqlite3.connect(self.db_path)
+                cursor = conn.cursor()
+                # Quick check that tables exist
+                cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='processed_profiles'")
+                if cursor.fetchone():
+                    logger.debug(f"Using existing database at {self.db_path}")
+                    conn.close()
+                    return
+                conn.close()
+                # Tables don't exist, need to create them
+            except sqlite3.Error:
+                # Database is corrupted, will recreate below
+                pass
+        
+        # Only create/initialize if doesn't exist or is invalid
         conn = None
         try:
             conn = sqlite3.connect(self.db_path)
@@ -32,7 +59,10 @@ class Repository:
                         raise
             
             conn.commit()
-            logger.log(f"Database initialized at {self.db_path}")
+            if not db_exists:
+                logger.log(f"Created new database at {self.db_path}")
+            else:
+                logger.log(f"Initialized database schema at {self.db_path}")
         except sqlite3.Error as e:
             logger.error(f"Error initializing database: {e}")
             raise
@@ -41,6 +71,7 @@ class Repository:
                 conn.close()
 
     def _execute_query(self, query, params=(), fetch_one=False, fetch_all=False):
+        self._ensure_initialized()
         conn = None
         try:
             conn = sqlite3.connect(self.db_path)
@@ -64,6 +95,7 @@ class Repository:
         Records a new profile or updates an existing one.
         Uses the two-table structure: processed_profiles and source_relationships
         """
+        self._ensure_initialized()
         conn = None
         try:
             conn = sqlite3.connect(self.db_path)
@@ -111,6 +143,7 @@ class Repository:
         """
         Gets a processed profile checking both the profile and source relationship
         """
+        # No need for _ensure_initialized() here since _execute_query calls it
         query = """
         SELECT p.twitter_handle, p.notion_page_id, p.last_updated_date
         FROM processed_profiles p

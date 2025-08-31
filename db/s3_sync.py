@@ -89,42 +89,86 @@ class S3DatabaseSync:
         return stats
     
     async def smart_download(self):
-        """Only download from S3 if it's newer than local database"""
+        """Download from S3 if local doesn't exist OR if S3 is newer"""
         if not USE_S3_SYNC:
             return
             
         try:
-            # Get local database timestamp if it exists
-            local_mtime = None
-            if os.path.exists(self.local_path):
-                local_mtime = os.path.getmtime(self.local_path)
-                local_mtime_str = datetime.fromtimestamp(local_mtime).strftime('%Y-%m-%d %H:%M:%S')
-                logger.log(f"📁 Local database last modified: {local_mtime_str}")
+            # Check if local database exists
+            local_exists = os.path.exists(self.local_path)
             
-            # Get S3 object metadata
-            try:
-                s3_info = self.s3.head_object(Bucket=self.bucket, Key=self.key)
-                s3_mtime = s3_info['LastModified'].timestamp()
-                s3_mtime_str = s3_info['LastModified'].strftime('%Y-%m-%d %H:%M:%S UTC')
-                logger.log(f"☁️  S3 database last modified: {s3_mtime_str}")
+            if not local_exists:
+                # No local database - MUST download from S3
+                logger.log(f"⚠️  No local database found at {self.local_path}")
+                logger.log(f"📥 Downloading database from S3 (required)...")
                 
-                # Compare timestamps
-                if local_mtime and s3_mtime <= local_mtime:
-                    logger.log(f"✅ Local database is newer or same as S3, keeping local version")
+                try:
+                    await self.download_latest()
+                    
+                    # Validate the download succeeded
+                    if not os.path.exists(self.local_path):
+                        logger.error("❌ CRITICAL: S3 download failed - no local database exists!")
+                        logger.error("Cannot proceed without database. Exiting.")
+                        raise RuntimeError("Failed to download database from S3 and no local database exists")
+                    
+                    # Validate the downloaded database has data
+                    stats = self._get_database_stats(self.local_path)
+                    if stats['total_profiles'] == 0:
+                        logger.error("❌ CRITICAL: Downloaded database is empty!")
+                        logger.error(f"Expected database with profiles, got empty database")
+                        raise RuntimeError("Downloaded database from S3 is empty")
+                    
+                    logger.log(f"✅ Successfully downloaded database with {stats['total_profiles']:,} profiles")
                     return
                     
-                logger.log(f"📥 S3 database is newer, downloading...")
-                await self.download_latest()
+                except ClientError as e:
+                    if e.response['Error']['Code'] == '404':
+                        logger.error("❌ CRITICAL: No database found in S3 and no local database exists!")
+                        logger.error("Cannot proceed without any database. Please provide a database.")
+                        raise RuntimeError("No database available - neither local nor in S3")
+                    else:
+                        logger.error(f"❌ CRITICAL: Failed to download database from S3: {e}")
+                        raise RuntimeError(f"S3 download failed and no local database exists: {e}")
+            else:
+                # Local database exists - compare with S3
+                local_mtime = os.path.getmtime(self.local_path)
+                local_mtime_str = datetime.fromtimestamp(local_mtime).strftime('%Y-%m-%d %H:%M:%S')
+                local_stats = self._get_database_stats(self.local_path)
+                logger.log(f"📁 Local database found: {local_stats['total_profiles']:,} profiles, last modified: {local_mtime_str}")
                 
-            except ClientError as e:
-                if e.response['Error']['Code'] == '404':
-                    logger.log("No database in S3, using local database")
-                else:
-                    raise
+                # Get S3 object metadata
+                try:
+                    s3_info = self.s3.head_object(Bucket=self.bucket, Key=self.key)
+                    s3_mtime = s3_info['LastModified'].timestamp()
+                    s3_mtime_str = s3_info['LastModified'].strftime('%Y-%m-%d %H:%M:%S UTC')
+                    s3_size_mb = s3_info['ContentLength'] / 1024 / 1024
+                    logger.log(f"☁️  S3 database: {s3_size_mb:.2f} MB, last modified: {s3_mtime_str}")
                     
+                    # Compare timestamps
+                    if s3_mtime <= local_mtime:
+                        logger.log(f"✅ Local database is newer or same as S3, keeping local version")
+                        return
+                        
+                    logger.log(f"📥 S3 database is newer, downloading...")
+                    await self.download_latest()
+                    
+                except ClientError as e:
+                    if e.response['Error']['Code'] == '404':
+                        logger.log("No database in S3, using local database")
+                    else:
+                        logger.error(f"Error checking S3 database: {e}")
+                        logger.log("Continuing with local database")
+                        
+        except RuntimeError:
+            # Re-raise critical errors
+            raise
         except Exception as e:
-            logger.error(f"Error in smart download: {e}")
-            # Don't fail the whole process, continue with local DB
+            logger.error(f"Unexpected error in smart download: {e}")
+            # If we have a local database, we can continue
+            if os.path.exists(self.local_path):
+                logger.warn("Continuing with existing local database")
+            else:
+                raise RuntimeError(f"No local database and download failed: {e}")
             
     async def download_latest(self):
         """Download the latest database from S3 to local"""
