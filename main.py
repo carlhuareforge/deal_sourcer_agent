@@ -627,7 +627,7 @@ async def process_username(username, is_new_username, following_counts):
             following_count = user.get('friends_count', 0)
             created_at_str = user.get('created_at')
             
-            account_age = 91  # Default to old account (> 90 days)
+            account_age = 181  # Default to old account (> 180 days)
             if created_at_str:
                 try:
                     # Parse date string from Twitter API (e.g., 'Mon Apr 29 00:00:00 +0000 2024')
@@ -642,12 +642,12 @@ async def process_username(username, is_new_username, following_counts):
                     logger.warn(f"Could not parse created_at date for @{user.get('screen_name')}: {created_at_str}")
                     # Keep account_age as default (old) if parsing fails
 
-            is_new_account = account_age <= 90  # Changed from MAX_ACCOUNT_AGE_DAYS to 90
+            is_new_account = account_age <= 180  # Classified as new if account is 180 days old or younger
             
             # Determine if we should process this profile
             # Process if EITHER condition is true:
             # 1. Both follower and following < 1000
-            # 2. New account (≤90 days old)
+            # 2. New account (≤180 days old)
             should_process = (
                 (follower_count < 1000 and following_count < 1000) or
                 is_new_account
