@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import pytz
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -115,9 +116,28 @@ async def test_get_following_counts(mock_throttled_request, fake_fs):
     assert counts["janedoe"] == 200
 
 @patch("main.throttled_rapid_api_request")
+async def test_get_following_counts_fallback_shape(mock_throttled_request, fake_fs):
+    """Ensure fallback API response structure is parsed correctly."""
+    mock_throttled_request.return_value = {
+        "data": {
+            "result": [
+                {"screen_name": "fallbackuser", "friends_count": "150"},
+                {"screen_name": "another_user", "friends_count": "75"}
+            ]
+        },
+        "source": "fallback"
+    }
+
+    profiles = [{"screen_name": "fallbackuser", "user_id": "123"}, {"screen_name": "another_user", "user_id": "456"}]
+    counts = await get_following_counts(profiles)
+
+    assert counts["fallbackuser"] == 150
+    assert counts["another_user"] == 75
+
+@patch("main.throttled_rapid_api_request")
 async def test_process_username_new_user(mock_throttled_request, fake_fs):
     """Test processing a user who is new (no previous data)."""
-    result = await process_username("newuser", is_new_username=True, following_counts={"newuser": 50})
+    result = await process_username("newuser", None, is_new_username=True, following_counts={"newuser": 50})
     assert result["total"] == 50
     assert result["new"] == 0  # No new followings detected for baseline
     assert not result["followings"]
@@ -127,15 +147,17 @@ async def test_process_username_new_user(mock_throttled_request, fake_fs):
 async def test_process_username_no_change(mock_throttled_request, mock_get_prev_count, fake_fs):
     """Test processing a user with no change in following count."""
     mock_get_prev_count.return_value = 100
-    result = await process_username("testuser", is_new_username=False, following_counts={"testuser": 100})
+    result = await process_username("testuser", None, is_new_username=False, following_counts={"testuser": 100})
     assert result["new"] == 0
     assert not result["followings"]
     mock_throttled_request.assert_not_called()
 
-@patch("main.get_previous_followings", new_callable=AsyncMock, return_value=[])
+@patch("services.deduplication_service.DeduplicationService.record_new_profile", new_callable=AsyncMock)
+@patch("services.deduplication_service.DeduplicationService.process_profile", new_callable=AsyncMock, return_value={"isNew": True})
+@patch("main.pytz.timezone", return_value=pytz.utc)
 @patch("main.get_previous_follower_count", new_callable=AsyncMock, return_value=100)
 @patch("main.throttled_rapid_api_request")
-async def test_process_username_with_new_followings(mock_throttled_request, mock_get_prev_count, mock_get_prev_followings, fake_fs):
+async def test_process_username_with_new_followings(mock_throttled_request, mock_get_prev_count, mock_timezone, mock_process_profile, mock_record_profile, fake_fs):
     """Test processing a user who has new followings."""
     mock_throttled_request.return_value = {
         "data": {
@@ -145,7 +167,7 @@ async def test_process_username_with_new_followings(mock_throttled_request, mock
             ]
         }
     }
-    result = await process_username("testuser", is_new_username=False, following_counts={"testuser": 102})
+    result = await process_username("testuser", "12345", is_new_username=False, following_counts={"testuser": 102})
 
     assert result["new"] == 1
     assert len(result["followings"]) == 1

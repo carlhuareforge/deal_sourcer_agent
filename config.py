@@ -12,7 +12,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # File paths
 INPUT_FILE = os.path.join(BASE_DIR, 'input_usernames.csv')
-# HISTORY_DIR = os.path.join(BASE_DIR, 'following_history')  # REMOVED: Legacy, not needed
+HISTORY_DIR = os.path.join(BASE_DIR, 'following_history')
 OUTPUT_DIR = os.path.join(BASE_DIR, 'new_following')
 TWEETS_DIR = os.path.join(BASE_DIR, 'follower_tweets')
 INPUT_HISTORY_DIR = os.path.join(BASE_DIR, 'input_history')
@@ -30,6 +30,8 @@ MAX_PROFILES = int(os.getenv('MAX_PROFILES', 75))
 # RapidAPI configuration
 RAPID_API_KEY = os.getenv('RAPID_API_KEY')
 RAPID_API_HOST = 'twitter135.p.rapidapi.com'
+RAPID_API_FALLBACK_KEY = os.getenv('RAPID_API_FALLBACK_KEY')
+RAPID_API_FALLBACK_HOST = os.getenv('RAPID_API_FALLBACK_HOST', 'twitter241.p.rapidapi.com')
 RAPID_API_REQUESTS_PER_SECOND = int(os.getenv('RAPID_API_REQUESTS_PER_SECOND', 5))  # Twitter API supports 5 req/sec
 RAPID_API_INTERVAL_MS = 1000 / RAPID_API_REQUESTS_PER_SECOND
 

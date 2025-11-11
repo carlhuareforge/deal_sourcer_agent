@@ -431,7 +431,47 @@ async def get_following_counts(profiles):
     batch_size = 200
     max_retries = 3
     failed_users = set()
-    
+
+    def safe_int(value):
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    def normalize_user_records(response):
+        """
+        Returns ([(screen_name, friends_count)], structure_type)
+        structure_type is 'legacy', 'fallback', or 'unknown'
+        """
+        data_section = response.get('data')
+        if not isinstance(data_section, dict):
+            return [], 'unknown'
+
+        # Legacy structure: {'data': {'users': [...]}}
+        if 'data' in data_section and isinstance(data_section['data'], dict):
+            nested_data = data_section['data']
+            if nested_data.get('users'):
+                data_section = nested_data
+
+        if data_section.get('users'):
+            normalized = []
+            for user in data_section['users']:
+                legacy = (user.get('result') or {}).get('legacy') or {}
+                screen_name = legacy.get('screen_name')
+                friends_count = legacy.get('friends_count')
+                normalized.append((screen_name, friends_count))
+            return normalized, 'legacy'
+
+        # Fallback structure: {'result': [ {...}, {...} ]}
+        result_block = data_section.get('result')
+        if isinstance(result_block, list):
+            normalized = []
+            for user in result_block:
+                normalized.append((user.get('screen_name'), user.get('friends_count')))
+            return normalized, 'fallback'
+
+        return [], 'unknown'
+
     try:
         user_ids = [p['user_id'] for p in profiles]
         
@@ -446,27 +486,29 @@ async def get_following_counts(profiles):
                 try:
                     response = await throttled_rapid_api_request(lambda: twitter_client.get_users_by_rest_ids(batch_ids))
                     
-                    # Debug: Log the raw response
                     logger.log(f"API response status: {response.get('status', 'No status')}")
+                    if response.get('source'):
+                        logger.log(f"API response source: {response['source']}")
                     logger.log(f"API response data keys: {list(response.get('data', {}).keys()) if response.get('data') else 'No data'}")
                     
-                    # Check if response has the expected structure
-                    if response.get('data') and 'data' in response['data']:
-                        # Double nested data structure
-                        actual_data = response['data']['data']
-                        if actual_data and actual_data.get('users'):
-                            response['data'] = actual_data  # Flatten the structure
+                    normalized_records, structure_type = normalize_user_records(response)
+                    if structure_type == 'fallback':
+                        logger.log("Using fallback get-users response format.")
                     
-                    if response['data'] and response['data'].get('users'):
-                        for user in response['data']['users']:
-                            if user.get('result') and user['result'].get('legacy'):
-                                screen_name = user['result']['legacy']['screen_name'].lower()
-                                following_count = user['result']['legacy']['friends_count']
-                                count_map[screen_name] = following_count
-                                logger.log(f"{screen_name}: {following_count} followings")
-                        success = True
-                    else:
+                    if not normalized_records:
                         raise ValueError('No users data in response')
+
+                    for screen_name, following_count in normalized_records:
+                        if not screen_name:
+                            continue
+                        parsed_count = safe_int(following_count)
+                        if parsed_count is None:
+                            logger.warn(f"Could not parse following count for @{screen_name}: {following_count}")
+                            continue
+                        screen_name_key = screen_name.lower()
+                        count_map[screen_name_key] = parsed_count
+                        logger.log(f"{screen_name_key}: {parsed_count} followings")
+                    success = True
                 except requests.exceptions.HTTPError as error:
                     if error.response and error.response.status_code == 429:
                         logger.log('Rate limit hit, waiting 2 seconds before retry...')
@@ -481,7 +523,6 @@ async def get_following_counts(profiles):
                     logger.error(f"Error processing batch {i // batch_size + 1}: {error}")
                     retry_count += 1
                     if retry_count < max_retries:
-                        # Increase wait time for timeout errors
                         if "timeout" in str(error).lower():
                             logger.log(f"Timeout error detected, waiting 10 seconds before retry...")
                             await asyncio.sleep(10)
@@ -509,7 +550,7 @@ async def get_following_counts(profiles):
         logger.error(f"Error checking following counts: {e}")
         return {}
 
-async def process_username(username, is_new_username, following_counts):
+async def process_username(username, user_id, is_new_username, following_counts):
     """
     Processes a single username's following changes.
     """
@@ -545,7 +586,7 @@ async def process_username(username, is_new_username, following_counts):
 
         while retry_count < max_retries:
             try:
-                response = await throttled_rapid_api_request(lambda: twitter_client.get_following(username, fetch_count))
+                response = await throttled_rapid_api_request(lambda: twitter_client.get_following(username, fetch_count, user_id))
 
                 if response['data'] and response['data'].get('error') == "Not authorized.":
                     logger.log('Profile is private')
@@ -646,10 +687,10 @@ async def process_username(username, is_new_username, following_counts):
             
             # Determine if we should process this profile
             # Process if EITHER condition is true:
-            # 1. Both follower and following < 1000
+            # 1. <3000 follower. following should be less than 1000 otherwise it doesnt feel organic.
             # 2. New account (≤180 days old)
             should_process = (
-                (follower_count < 1000 and following_count < 1000) or
+                (follower_count < 3000 and following_count < 1000) or
                 is_new_account
             )
             
@@ -1103,7 +1144,7 @@ async def main():
                     continue
 
                 try:
-                    results = await process_username(profile['screen_name'], is_new_username, following_counts)
+                    results = await process_username(profile['screen_name'], profile.get('user_id'), is_new_username, following_counts)
 
                     # Collect tweets for new followers if any were found
                     if results['followings']:
