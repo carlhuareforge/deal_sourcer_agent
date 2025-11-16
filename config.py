@@ -41,7 +41,7 @@ OPENAI_MAX_RETRIES = int(os.getenv('OPENAI_MAX_RETRIES', 3))
 OPENAI_TIMEOUT_MS = int(os.getenv('OPENAI_TIMEOUT_MS', 120000))
 OPENAI_REQUESTS_PER_MINUTE = int(os.getenv('OPENAI_REQUESTS_PER_MINUTE', 60))
 OPENAI_THROTTLE_INTERVAL_MS = 60000 / OPENAI_REQUESTS_PER_MINUTE
-OPENAI_MODEL = os.getenv('OPENAI_MODEL', 'gpt-5') # Default to 'o3' as per app.js
+OPENAI_MODEL = os.getenv('OPENAI_MODEL', 'gpt-5.1') # Default to 'o3' as per app.js
 
 # Deduplication and filtering
 MAX_FOLLOWERS = int(os.getenv('MAX_FOLLOWERS', 1000))
