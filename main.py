@@ -557,6 +557,20 @@ async def process_username(username, is_new_username, following_counts):
 
                 break # Success
             except requests.exceptions.HTTPError as error:
+                # Option A: Detect protected accounts from provider error body and short-circuit gracefully
+                protected = False
+                try:
+                    if error.response is not None and error.response.text:
+                        body = error.response.json()
+                        if isinstance(body, dict) and body.get('error') == 'Not authorized.':
+                            protected = True
+                except Exception:
+                    protected = False
+
+                if protected:
+                    logger.log('Protected account; skipping')
+                    return { "total": current_count, "new": 0, "previousCount": previous_count, "followings": [] }
+
                 last_error = error
                 retry_count += 1
                 
