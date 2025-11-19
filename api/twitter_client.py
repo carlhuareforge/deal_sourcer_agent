@@ -141,14 +141,17 @@ class TwitterClient:
         return await throttled_rapid_api_request(lambda: make_http_request(options))
 
     async def get_following(self, username, count):
+        # Switch to new endpoint because the old API no longer works
+        headers = dict(self.headers)
+        headers['x-rapidapi-host'] = 'twitter283.p.rapidapi.com'
         options = {
             'method': 'GET',
-            'url': 'https://twitter135.p.rapidapi.com/v1.1/Following/',
+            'url': 'https://twitter283.p.rapidapi.com/FollowingLight',
             'params': {
                 'username': username,
                 'count': str(count)
             },
-            'headers': self.headers
+            'headers': headers
         }
         return await throttled_rapid_api_request(lambda: make_http_request(options))
 
