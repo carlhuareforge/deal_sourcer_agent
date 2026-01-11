@@ -25,7 +25,7 @@ from config import (
 
 from api.twitter_client import TwitterClient, throttled_rapid_api_request
 from api.twitter_parser import simplify_twitter_data, extract_tweets_from_response
-from api.notion_client import initialize_notion_categories, get_existing_categories, add_notion_database_entry, update_notion_database_entry
+from api.notion_client import initialize_notion_categories, add_notion_database_entry, update_notion_database_entry
 from api.openai_client import get_openai_client, create_throttler
 from services.deduplication_service import DeduplicationService
 from db.s3_sync import S3DatabaseSync
@@ -35,9 +35,6 @@ from db.repository import repository
 # Initialize clients
 twitter_client = TwitterClient()
 openai_client = get_openai_client()
-
-# Global reference to Notion categories
-notion_categories = ['Unknown']
 
 # Global list for skipped profiles
 skipped_profiles = []
@@ -118,16 +115,14 @@ async def load_prompt(filename):
 
 async def prepare_analysis_prompt():
     """
-    Prepares the analysis prompt by inserting dynamic categories.
+    Loads the analysis prompt template.
     """
     try:
         base_prompt = await load_prompt('tweet_analysis_prompt.txt')
         if not base_prompt:
             raise ValueError("Base prompt could not be loaded.")
-        
-        # Insert the categories array into the prompt
-        final_prompt = base_prompt.replace('{categories}', json.dumps(notion_categories))
-        return final_prompt
+
+        return base_prompt
     except Exception as e:
         logger.error(f"Error preparing prompt: {e}")
         raise
@@ -162,7 +157,7 @@ async def analyze_tweets_with_ai(tweets_file_path, custom_throttler=None):
                 first_tweet = simplified_data['tweets'][0]
                 logger.log(f"- First Tweet Sample: \"{first_tweet[:100]}{ '...' if len(first_tweet) > 100 else ''}\"")
 
-        # 3. Build prompt (inserting Notion categories)
+        # 3. Build prompt
         prompt = await prepare_analysis_prompt()
         
         # Create AI input data with timestamp
@@ -325,27 +320,47 @@ async def analyze_tweets_with_ai(tweets_file_path, custom_throttler=None):
         
         logger.log(f"AI Response for @{screen_name}:")
         logger.log(f"- AI Name: {parsed_data.get('name', 'Not provided')}")
+        raw_categories = parsed_data.get('categories', [])
+        if raw_categories is None:
+            raw_categories = []
+        if not isinstance(raw_categories, list):
+            raw_categories = [raw_categories]
+        parsed_data['categories'] = [str(cat).strip() for cat in raw_categories if str(cat).strip()]
+
         logger.log(f"- AI Categories: {parsed_data.get('categories', [])}")
         logger.log(f"- AI Summary (first 200 chars): {parsed_data.get('summary', '')[:200]}{ '...' if len(parsed_data.get('summary', '')) > 200 else ''}")
 
         # 6. If it's an individual "Profile" or contains "Gaming/NFT" or meme-related categories, skip Notion
+        categories = parsed_data.get('categories', [])
+        categories_lower = [cat.lower() for cat in categories]
+
         skip_categories = ['Gaming/NFT', 'Meme', 'Memecoin', 'AI Meme']
-        has_meme_category = any(cat in skip_categories or 'meme' in cat.lower() or 'memecoin' in cat.lower() for cat in parsed_data.get('categories', []))
+        skip_categories_lower = {cat.lower() for cat in skip_categories}
+        has_meme_category = any(
+            cat_lower in skip_categories_lower or 'meme' in cat_lower or 'memecoin' in cat_lower
+            for cat_lower in categories_lower
+        )
 
         if has_meme_category:
-            meme_category = next((cat for cat in parsed_data.get('categories', []) if cat in skip_categories or 'meme' in cat.lower() or 'memecoin' in cat.lower()), None)
+            meme_category = next(
+                (
+                    cat
+                    for cat in categories
+                    if cat.lower() in skip_categories_lower or 'meme' in cat.lower() or 'memecoin' in cat.lower()
+                ),
+                None,
+            )
             logger.log(f"- Decision Factor: Contains meme category: {meme_category}")
 
+        is_profile_only = len(categories_lower) == 1 and categories_lower[0] == 'profile'
+
         if (
-            isinstance(parsed_data.get('categories'), list) and
-            (
-                (len(parsed_data['categories']) == 1 and parsed_data['categories'][0] == 'Profile') or
-                has_meme_category
-            )
+            isinstance(categories, list)
+            and (is_profile_only or has_meme_category)
         ):
             skip_reason = 'Profile'
             if has_meme_category:
-                skip_reason = next((cat for cat in parsed_data.get('categories', []) if cat in skip_categories or 'meme' in cat.lower() or 'memecoin' in cat.lower()), 'Meme/NFT')
+                skip_reason = meme_category or 'Meme/NFT'
             
             skipped_profiles.append({
                 "username": screen_name,
@@ -370,7 +385,7 @@ async def analyze_tweets_with_ai(tweets_file_path, custom_throttler=None):
             logger.log(f"- AI Categories Assigned: {parsed_data.get('categories', [])}")
             logger.log(f"- AI Summary: {parsed_data.get('summary', '')[:150]}{ '...' if len(parsed_data.get('summary', '')) > 150 else ''}")
             
-            if len(parsed_data.get('categories', [])) == 1 and parsed_data['categories'][0] == 'Profile':
+            if is_profile_only:
                 logger.log(f"- Skip Logic: Single category 'Profile' detected")
             if has_meme_category:
                 logger.log(f"- Skip Logic: Meme-related category detected")
@@ -386,14 +401,12 @@ async def analyze_tweets_with_ai(tweets_file_path, custom_throttler=None):
             return None
 
         # 7. Otherwise, proceed with Notion upload
-        final_cats = [cat for cat in parsed_data.get('categories', []) if cat in notion_categories]
-        if not final_cats:
-            final_cats = ['Unknown']
+        final_cats = parsed_data.get('categories', []) or ['Unknown']
 
         logger.log(f"\n✅ UPLOADING to Notion: @{screen_name}")
         logger.log(f"- AI Name: {parsed_data.get('name')}")
         logger.log(f"- AI Categories: {parsed_data.get('categories', [])}")
-        logger.log(f"- Final Categories (filtered): {final_cats}")
+        logger.log(f"- Final Categories: {final_cats}")
         logger.log(f"- Upload Reason: Not a Profile-only or meme category")
         
         logger.log(f"\nProfile Details:")
@@ -422,7 +435,11 @@ async def analyze_tweets_with_ai(tweets_file_path, custom_throttler=None):
             last_updated_raw = existing_profile.get("last_updated_date") if existing_profile else None
             if last_updated_raw:
                 try:
-                    last_updated_dt = datetime.fromisoformat(last_updated_raw)
+                    normalized_last_updated = last_updated_raw
+                    if isinstance(normalized_last_updated, str) and normalized_last_updated.endswith("Z"):
+                        normalized_last_updated = normalized_last_updated[:-1] + "+00:00"
+
+                    last_updated_dt = datetime.fromisoformat(normalized_last_updated)
                     now_dt = datetime.now(last_updated_dt.tzinfo) if last_updated_dt.tzinfo else datetime.now()
                     days_since_last_update = (now_dt - last_updated_dt).days
                 except ValueError:
@@ -1108,7 +1125,7 @@ async def save_follower_counts(count_map):
 # We now use database-based deduplication which is superior
 
 async def main():
-    global notion_categories, skipped_profiles, analysis_errors, stale_notion_updates # Declare intent to modify global lists
+    global skipped_profiles, analysis_errors, stale_notion_updates # Declare intent to modify global lists
 
     # Reset per-run tracking (important for tests or repeated invocations in the same process)
     skipped_profiles = []
@@ -1165,9 +1182,8 @@ async def main():
         await clean_directory(RAW_RESPONSES_DIR)
         await clean_ai_tweets_directory()
 
-    # Initialize Notion categories once
+    # Validate Notion database schema once (if Notion upload is enabled)
     await initialize_notion_categories()
-    notion_categories = await get_existing_categories()
 
     try:
         logger.log('Initializing Twitter API client...')

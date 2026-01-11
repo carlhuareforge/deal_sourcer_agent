@@ -30,7 +30,7 @@ MAX_PROFILES = int(os.getenv('MAX_PROFILES', 75))
 # RapidAPI configuration
 RAPID_API_KEY = os.getenv('RAPID_API_KEY')
 RAPID_API_HOST = 'twitter283.p.rapidapi.com'
-RAPID_API_REQUESTS_PER_SECOND = int(os.getenv('RAPID_API_REQUESTS_PER_SECOND', 5))  # Twitter API supports 5 req/sec
+RAPID_API_REQUESTS_PER_SECOND = int(os.getenv('RAPID_API_REQUESTS_PER_SECOND', 25))  # Twitter 283 allows higher throughput; default to 25 rps
 RAPID_API_INTERVAL_MS = 1000 / RAPID_API_REQUESTS_PER_SECOND
 
 # OpenAI configuration
@@ -47,8 +47,8 @@ MAX_FOLLOWING = int(os.getenv('MAX_FOLLOWING', 1000))
 MAX_ACCOUNT_AGE_DAYS = int(os.getenv('MAX_ACCOUNT_AGE_DAYS', 45))
 
 # Concurrency
-MAX_CONCURRENT_REQUESTS = int(os.getenv('MAX_CONCURRENT_REQUESTS', 2)) # For tweet collection
-CONCURRENT_PROCESSES = int(os.getenv('CONCURRENT_PROCESSES', 5)) # For AI analysis
+MAX_CONCURRENT_REQUESTS = int(os.getenv('MAX_CONCURRENT_REQUESTS', 20)) # For tweet collection
+CONCURRENT_PROCESSES = int(os.getenv('CONCURRENT_PROCESSES', 10)) # For AI analysis
 
 # Debug mode
 DEBUG_MODE = os.getenv('DEBUG_MODE', 'False').lower() == 'true'

@@ -42,8 +42,13 @@ class DeduplicationService:
             last_updated_raw = existing_profile.get("last_updated_date")
             if last_updated_raw:
                 try:
-                    last_updated_dt = datetime.fromisoformat(last_updated_raw)
-                    delta = now - last_updated_dt
+                    normalized_last_updated = last_updated_raw
+                    if isinstance(normalized_last_updated, str) and normalized_last_updated.endswith("Z"):
+                        normalized_last_updated = normalized_last_updated[:-1] + "+00:00"
+
+                    last_updated_dt = datetime.fromisoformat(normalized_last_updated)
+                    now_dt = datetime.now(last_updated_dt.tzinfo) if last_updated_dt.tzinfo else now
+                    delta = now_dt - last_updated_dt
                     days_since_last_seen = delta.days
                     seen_recently = delta < timedelta(days=seen_within_days)
                 except ValueError:

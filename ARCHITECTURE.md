@@ -1,6 +1,6 @@
 # Twitter Following Discovery + AI Triage (Architecture)
 
-This project watches a set of “source” X/Twitter accounts, detects when they follow new accounts, collects a small tweet sample for those newly-followed accounts, runs an LLM classification step, and (optionally) uploads the results to a Notion database. A SQLite DB is used to deduplicate profiles globally so the same discovered account is only processed once across all sources.
+This project watches a set of “source” X/Twitter accounts, detects when they follow new accounts, collects a small tweet sample for those newly-followed accounts, runs an LLM classification step, and (optionally) uploads the results to a Notion database. A SQLite DB is used to deduplicate profiles globally using a recency window (default: 28 days): recently-processed accounts are skipped, older accounts can be re-processed, and accounts classified as personal `Profile` are permanently skipped.
 
 ## Key Inputs / Outputs
 
@@ -24,7 +24,7 @@ flowchart TB
     COUNTS[get_following_counts()]
     PREV[get_previous_follower_count()]
     PROC[process_username()]
-    FILTER[Dedup + age/count filter]
+    FILTER[Dedup + recency filter (28d)]
     COLLECT[collect_tweets_for_new_followers()]
     AI[analyze_tweets_with_ai()]
   end
@@ -87,9 +87,10 @@ flowchart TB
      - If `count_diff == 0`: skip (no processing).
      - Otherwise: fetches the most recent followings using RapidAPI `FollowingLight` with `fetch_count = count_diff` (or `3` if `count_diff <= 0`).
 
-6. **Filter discovered accounts (dedup + age/size heuristics)** (detailed below)
+6. **Filter discovered accounts (DB-backed dedup + recency window)** (detailed below)
    - Only the accounts that pass this filter become “work items” for tweet collection + AI processing.
-   - Accounts filtered out here are still recorded in the dedup DB, which prevents repeated evaluation later.
+   - Existing profiles skipped due to the recency window do not have `last_updated_date` bumped (so they can “age out” and be re-processed later).
+   - `main()` also suppresses duplicates within a single run (`seen_handles` / `batch_seen`) before tweet collection.
 
 7. **Collect tweets for included accounts**
    - For each included discovered account:
@@ -110,85 +111,118 @@ flowchart TB
    - Logs run summary and skip breakdown (AI-triage skips).
    - Optional S3 sync: uploads the updated DB + newest follower counts file.
 
-## Detailed Filtering: Account Age + “What Gets Processed”
+## Detailed Filtering: Dedup + Recency Window (28 days)
 
-This is the most important gate for deciding which discovered accounts turn into tweet collection + AI analysis work.
+This is the primary gate for deciding which discovered accounts turn into tweet collection + AI analysis work.
 
 ### Where this happens
 
-- The filter lives inside `process_username()` in `main.py`, and runs **after** a global dedup check via `DeduplicationService.process_profile()`.
+- `process_username()` calls `DeduplicationService.process_profile()` for each candidate returned by RapidAPI `FollowingLight`.
+- `main()` additionally suppresses duplicates within a single run using `seen_handles` (cross-source) and `batch_seen` (within a single source batch).
 
 ### Step 0: “Is this source eligible to produce work?”
 
 - If the source account is **new** (no previous `follower_counts_*.csv` entry): it returns “Baseline” and produces **no work items**.
 - If the source’s following count **did not change** (`count_diff == 0`): produces **no work items**.
+- If followings cannot be fetched (e.g., protected / not authorized): produces **no work items**.
 
 Only sources with a nonzero diff proceed to fetch and filter recent followings.
 
-### Step 1: Global dedup check (first gate)
+### Step 1: Global dedup + recency window (DB-backed)
 
-For each candidate account returned by `FollowingLight`:
+For each candidate account returned by `FollowingLight`, `DeduplicationService.process_profile()` checks `db/twitter_profiles.db`:
 
-- If the handle already exists in `db/twitter_profiles.db`: **skip immediately** (no filtering, no tweet collection, no AI).
-- If it has never been seen: it proceeds to the age/size filter.
-
-### Step 2: Account age calculation (EST-normalized)
-
-- Reads `created_at` from the Twitter API user object (string like `Mon Apr 29 00:00:00 +0000 2024`).
-- If `created_at` is missing or cannot be parsed: `account_age_days` defaults to `181` (treated as “old”).
+- If the saved `category == "Profile"`: **always skip** (personal profiles are permanently excluded), but the source relationship is still recorded.
 - Otherwise:
-  - Parses with `datetime.strptime(..., '%a %b %d %H:%M:%S %z %Y')`
-  - Converts `created_at` and `now` to `America/New_York`
-  - Computes `account_age_days = (now_est - created_at_est).days`
+  - If `last_updated_date` is within the last **28 days**: **skip** and **do not bump** `last_updated_date` (so it can age out).
+  - If `last_updated_date` is older than **28 days** (or missing/unparseable): treat as **eligible again** and allow it through for re-processing.
 
-### Step 3: “Should we process this account?”
+### Step 2: In-run duplicate suppression
 
-Current rule in `main.py` (hard-coded thresholds):
+Because newly-included handles are only written to the DB after AI triage, the same handle can appear multiple times in a single run (across sources or within a batch). `main()` prevents duplicate tweet collection by skipping:
 
-```text
-is_new_account = (account_age_days <= 180)
-low_counts     = (followers_count < 1000) AND (friends_count < 1000)
+- Handles already queued earlier in the run (`seen_handles`)
+- Duplicates within the same source’s “new followings” list (`batch_seen`)
 
-should_process = is_new_account OR low_counts
-```
+### What happens on include vs skip
 
-- **Included (sent for processing)** if:
-  - The account is **new** (≤ 180 days), even if it has high follower/following counts, OR
-  - The account is **small-ish** (both followers and following under 1000), even if it is old
-- **Excluded (not sent for processing)** if:
-  - The account is **old** (> 180 days *or unknown age*) AND
-  - It has **high** followers or following (either count ≥ 1000)
+- **Included** → tweet collection writes `follower_tweets/{handle}_tweets.json`, then AI analysis runs:
+  - If AI triage decides **skip Notion** (Profile-only or meme/NFT categories): `record_new_profile(... category="Profile", notion_page_id=None ...)`
+  - If AI triage decides **upload/update Notion**: `record_new_profile(... category="Project", notion_page_id=... ...)`
+  - If AI/Notion processing errors: it still records the handle (with `notion_page_id=None`) to avoid infinite retry loops.
+- **Skipped by dedup/recency** → no tweet file is written and `last_updated_date` is not changed.
 
-### Step 4: What happens on include vs exclude
-
-- **If included**: the account is appended to the “new followings” list and later:
-  - Tweet collection runs (`*_tweets.json` is written)
-  - AI analysis runs (and may still be skipped at Notion upload time if classified as `Profile`/meme)
-- **If excluded**: it is still recorded in the dedup DB via `record_new_profile(... notion_page_id=None ...)`.
-  - This means excluded accounts are treated as “processed” and won’t be reconsidered later unless the DB is reset.
-
-### Filtering decision diagram
+### Dedup/recency decision diagram
 
 ```mermaid
 flowchart TD
-  Candidate[Candidate following user] --> Dedup{Exists in dedup DB?}
-  Dedup -->|Yes| SkipDup[Skip\n(already processed)]
-  Dedup -->|No| CreatedAt{created_at present\nand parseable?}
-  CreatedAt -->|No| AgeDefault[account_age_days = 181\n(treated old)]
-  CreatedAt -->|Yes| AgeCalc[account_age_days = (now_EST - created_at_EST).days]
-
-  AgeDefault --> NewCheck{account_age_days <= 180?}
-  AgeCalc --> NewCheck
-
-  NewCheck -->|Yes| IncludeNew[Include\nNew account]
-  NewCheck -->|No| CountsCheck{followers < 1000\nAND following < 1000?}
-  CountsCheck -->|Yes| IncludeSmall[Include\nLow counts]
-  CountsCheck -->|No| Exclude[Exclude\nOld/unknown age + high counts\nRecord in DB as processed]
-
-  IncludeNew --> Enqueue[Enqueue for tweet fetch + AI]
-  IncludeSmall --> Enqueue
+  Cand[Candidate following user] --> Check[DeduplicationService.process_profile()]
+  Check -->|category == Profile| SkipProfile[Skip (Profile)\nrecord source relationship]
+  Check -->|seen < 28d| SkipRecent[Skip (seen recently)\nno last_updated bump]
+  Check -->|new or >= 28d| Include[Include\ncollect tweets + AI]
 ```
 
 ### Note on configuration vs implementation
 
-`config.py` defines `MAX_FOLLOWERS`, `MAX_FOLLOWING`, and `MAX_ACCOUNT_AGE_DAYS`, but `main.py` currently uses hard-coded values (`1000` and `180`) in the followings filter logic. If you intend these limits to be configurable, the filter needs to be wired to those config constants.
+The recency window is currently hard-coded as `28` days in `services/deduplication_service.py`. If you want it configurable, wire it to `config.py` and use it in both the dedup check and the “stale Notion update” reporting.
+
+## End-to-End Flow Diagram (Twitter → Tweets → AI → Notion)
+
+```mermaid
+flowchart TD
+  Start([Start]) --> Setup[Load config / ensure dirs]
+  Setup --> S3{USE_S3_SYNC?}
+  S3 -->|Yes| S3DL[Smart-download DB + follower counts]
+  S3 -->|No| Seed[Read input_usernames.csv]
+  S3DL --> Seed
+
+  Seed --> NotionCats[Initialize Notion categories\n(get_existing_categories)]
+  NotionCats --> Counts[RapidAPI UsersByRestIds\nget following counts]
+
+  Counts --> SrcLoop{{For each source account}}
+  SrcLoop --> Prev[Read previous count from follower_counts/*.csv]
+  Prev --> Baseline{Previous count exists?}
+  Baseline -->|No| BaselineOnly[Baseline only\n(no followings fetched)] --> SrcLoop
+
+  Baseline -->|Yes| Diff{count_diff == 0?}
+  Diff -->|Yes| NoChange[Skip source (no changes)] --> SrcLoop
+
+  Diff -->|No| Followings[RapidAPI FollowingLight\nfetch recent followings]
+  Followings --> Protected{Protected / not authorized?}
+  Protected -->|Yes| SkipProtected[Skip source] --> SrcLoop
+
+  Protected -->|No| CandLoop{{For each candidate following}}
+  CandLoop --> Dedup{DB dedup + 28d recency?\n(DeduplicationService.process_profile)}
+  Dedup -->|category=Profile| SkipProfile[Skip candidate (Profile)] --> CandLoop
+  Dedup -->|seen < 28d| SkipRecent[Skip candidate (recent)] --> CandLoop
+  Dedup -->|new or >=28d| RunDup{Already queued this run?\n(seen_handles / batch_seen)}
+  RunDup -->|Yes| SkipRunDup[Skip candidate (run duplicate)] --> CandLoop
+
+  RunDup -->|No| Tweets[RapidAPI UserTweets\n(paginate; fallback UserTweetsAndReplies)]
+  Tweets --> WriteTweets[Write follower_tweets/*_tweets.json\n+ raw_api_responses/*.json] --> CandLoop
+
+  SrcLoop --> SaveCounts[Write new follower_counts_*.csv]
+  SaveCounts --> Files[Find tweet files\nsort by complexity]
+  Files --> FileLoop{{For each tweet file}}
+
+  FileLoop --> OpenAI[OpenAI classify (JSON object)]
+  OpenAI --> AIError{AI/parse/Notion error?}
+  AIError -->|Yes| MarkError[Record analysis error\nrecord_new_profile(notion_page_id=None)] --> FileLoop
+
+  AIError -->|No| Triage{Profile-only or meme/NFT?}
+  Triage -->|Yes| SkipNotion[Skip Notion\nrecord_new_profile(category=Profile)] --> FileLoop
+
+  Triage -->|No| NotionOn{NOTION_UPLOAD_ENABLED?}
+  NotionOn -->|No| MockNotion[Skip network call\n(mock Notion response)] --> RecordProject
+
+  NotionOn -->|Yes| ExistingPage{Existing notion_page_id?}
+  ExistingPage -->|No| CreatePage[Create Notion page] --> RecordProject
+  ExistingPage -->|Yes| UpdatePage[Update Notion page] --> Stale{days since last update >= 28?}
+  Stale -->|Yes| TrackStale[Add to stale update list] --> RecordProject
+  Stale -->|No| RecordProject
+
+  RecordProject[record_new_profile(category=Project)] --> FileLoop
+
+  FileLoop --> Summary[Final run summary log\n(processed/uploaded/skipped)\n+ skip breakdown + stale updates]
+  Summary --> End([End])
+```
