@@ -1,6 +1,6 @@
 # Twitter Following Discovery + AI Triage (Architecture)
 
-This project watches a set of “source” X/Twitter accounts, detects when they follow new accounts, collects a small tweet sample for those newly-followed accounts, runs an LLM classification step, and (optionally) uploads the results to a Notion database. A SQLite DB is used to deduplicate profiles globally using a recency window (default: 28 days): recently-processed accounts are skipped, older accounts can be re-processed, and accounts classified as personal `Profile` are permanently skipped.
+This project watches a set of “source” X/Twitter accounts, detects when they follow new accounts, collects a small tweet sample for those newly-followed accounts, runs an LLM classification step, and (optionally) uploads the results to a Notion database. A SQLite DB is used to deduplicate profiles globally using a recency window (default: 90 days): recently-processed accounts are skipped, older accounts can be re-processed, and accounts classified as personal `Profile` are permanently skipped.
 
 ## Key Inputs / Outputs
 
@@ -16,7 +16,7 @@ This project watches a set of “source” X/Twitter accounts, detects when they
 
 ```mermaid
 flowchart TB
-  CSV[input_usernames.csv\n(screen_name,user_id)]
+  CSV[input_usernames.csv<br>screen_name and user_id]
   ENV[.env + config.py]
 
   subgraph Main["main.py"]
@@ -24,7 +24,7 @@ flowchart TB
     COUNTS[get_following_counts()]
     PREV[get_previous_follower_count()]
     PROC[process_username()]
-    FILTER[Dedup + recency filter (28d)]
+    FILTER[Dedup and recency filter<br>90 days]
     COLLECT[collect_tweets_for_new_followers()]
     AI[analyze_tweets_with_ai()]
   end
@@ -111,7 +111,7 @@ flowchart TB
    - Logs run summary and skip breakdown (AI-triage skips).
    - Optional S3 sync: uploads the updated DB + newest follower counts file.
 
-## Detailed Filtering: Dedup + Recency Window (28 days)
+## Detailed Filtering: Dedup + Recency Window (90 days)
 
 This is the primary gate for deciding which discovered accounts turn into tweet collection + AI analysis work.
 
@@ -134,8 +134,9 @@ For each candidate account returned by `FollowingLight`, `DeduplicationService.p
 
 - If the saved `category == "Profile"`: **always skip** (personal profiles are permanently excluded), but the source relationship is still recorded.
 - Otherwise:
-  - If `last_updated_date` is within the last **28 days**: **skip** and **do not bump** `last_updated_date` (so it can age out).
-  - If `last_updated_date` is older than **28 days** (or missing/unparseable): treat as **eligible again** and allow it through for re-processing.
+  - If the account age is under **1 year** and the profile already exists in the DB: **skip** and do not recheck for pivot yet.
+  - If `last_updated_date` is within the last **90 days**: **skip** and **do not bump** `last_updated_date` (so it can age out).
+  - If `last_updated_date` is older than **90 days** (or missing/unparseable): treat as **eligible again** and allow it through for re-processing.
 
 ### Step 2: In-run duplicate suppression
 
@@ -158,13 +159,13 @@ Because newly-included handles are only written to the DB after AI triage, the s
 flowchart TD
   Cand[Candidate following user] --> Check[DeduplicationService<br>process_profile]
   Check -->|category == Profile| SkipProfile[Skip personal Profile<br>record source relationship]
-  Check -->|seen < 28d| SkipRecent[Skip seen recently<br>do not bump timestamp]
-  Check -->|new or >= 28d| Include[Include<br>collect tweets and AI]
+  Check -->|seen < 90d| SkipRecent[Skip seen recently<br>do not bump timestamp]
+  Check -->|new or >= 90d| Include[Include<br>collect tweets and AI]
 ```
 
 ### Note on configuration vs implementation
 
-The recency window is currently hard-coded as `28` days in `services/deduplication_service.py`. If you want it configurable, wire it to `config.py` and use it in both the dedup check and the “stale Notion update” reporting.
+The recency window is currently hard-coded as `90` days in `services/deduplication_service.py`. If you want it configurable, wire it to `config.py` and use it in both the dedup check and the “stale Notion update” reporting.
 
 ## End-to-End Flow Diagram Twitter to AI to Notion
 
@@ -178,7 +179,7 @@ flowchart TD
   Candidate --> Dedup[Check DB dedup<br>and recency window]
   Dedup --> DbProfile{DB says personal Profile}
   DbProfile -->|Yes| SkipPermanent[Skip permanently<br>and record relationship]
-  DbProfile -->|No| Recent{Seen in last 28 days}
+  DbProfile -->|No| Recent{Seen in last 90 days}
   Recent -->|Yes| SkipRecent[Skip for now<br>and do not bump timestamp]
   Recent -->|No| RunDup{Already queued this run}
   RunDup -->|Yes| SkipRunDup[Skip run duplicate]

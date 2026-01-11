@@ -4,13 +4,37 @@ from datetime import datetime, timedelta
 
 class DeduplicationService:
     @staticmethod
-    async def process_profile(twitter_handle, source_username):
+    def _parse_twitter_created_at(created_at_raw):
+        if not created_at_raw or not isinstance(created_at_raw, str):
+            return None
+
+        try:
+            return datetime.strptime(created_at_raw, '%a %b %d %H:%M:%S %z %Y')
+        except Exception:
+            pass
+
+        try:
+            normalized = created_at_raw
+            if normalized.endswith("Z"):
+                normalized = normalized[:-1] + "+00:00"
+            return datetime.fromisoformat(normalized)
+        except Exception:
+            return None
+
+    @staticmethod
+    async def process_profile(twitter_handle, source_username, profile_created_at=None):
         """
         Processes a profile discovery, handling both new and existing profiles.
         Matches JavaScript logic exactly - checks globally, not per source.
         """
         if not twitter_handle:
             return {"isNew": True}
+
+        account_age_days = None
+        created_dt = DeduplicationService._parse_twitter_created_at(profile_created_at)
+        if created_dt:
+            now_dt = datetime.now(created_dt.tzinfo) if created_dt.tzinfo else datetime.now()
+            account_age_days = (now_dt - created_dt).days
 
         # Check if profile exists globally (like JavaScript)
         existing_profile = repository.find_by_handle(twitter_handle)
@@ -25,7 +49,9 @@ class DeduplicationService:
                     "profile": existing_profile,
                     "sources": sources,
                     "daysSinceLastSeen": 0,
-                    "seenWithinDays": 28
+                    "seenWithinDays": 90,
+                    "skipReason": "category_profile",
+                    "accountAgeDays": account_age_days,
                 }
 
             # Add new source relationship
@@ -34,10 +60,23 @@ class DeduplicationService:
             # Get all sources that discovered this profile
             sources = repository.get_sources_for_profile(twitter_handle)
 
-            seen_within_days = 28
+            seen_within_days = 90
+            min_account_age_days_for_recheck = 365
             now = datetime.now()
             days_since_last_seen = None
             seen_recently = False
+
+            if account_age_days is not None and account_age_days < min_account_age_days_for_recheck:
+                return {
+                    "isNew": False,
+                    "profile": existing_profile,
+                    "sources": sources,
+                    "daysSinceLastSeen": days_since_last_seen,
+                    "seenWithinDays": seen_within_days,
+                    "skipReason": "account_too_new_for_recheck",
+                    "accountAgeDays": account_age_days,
+                    "minAccountAgeDaysForRecheck": min_account_age_days_for_recheck,
+                }
 
             last_updated_raw = existing_profile.get("last_updated_date")
             if last_updated_raw:
@@ -61,7 +100,10 @@ class DeduplicationService:
                     "profile": existing_profile,
                     "sources": sources,
                     "daysSinceLastSeen": days_since_last_seen,
-                    "seenWithinDays": seen_within_days
+                    "seenWithinDays": seen_within_days,
+                    "skipReason": "seen_recently",
+                    "accountAgeDays": account_age_days,
+                    "minAccountAgeDaysForRecheck": min_account_age_days_for_recheck,
                 }
 
             # Older than the recency window: allow it through for re-processing.
@@ -70,7 +112,10 @@ class DeduplicationService:
                 "profile": existing_profile,
                 "sources": sources,
                 "daysSinceLastSeen": days_since_last_seen,
-                "seenWithinDays": seen_within_days
+                "seenWithinDays": seen_within_days,
+                "skipReason": "eligible_for_reprocess",
+                "accountAgeDays": account_age_days,
+                "minAccountAgeDaysForRecheck": min_account_age_days_for_recheck,
             }
         
         return {

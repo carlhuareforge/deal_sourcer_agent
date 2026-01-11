@@ -25,7 +25,12 @@ from config import (
 
 from api.twitter_client import TwitterClient, throttled_rapid_api_request
 from api.twitter_parser import simplify_twitter_data, extract_tweets_from_response
-from api.notion_client import initialize_notion_categories, add_notion_database_entry, update_notion_database_entry
+from api.notion_client import (
+    initialize_notion_categories,
+    add_notion_database_entry,
+    update_notion_database_entry,
+    update_notion_date_and_recheck_for_pivot,
+)
 from api.openai_client import get_openai_client, create_throttler
 from services.deduplication_service import DeduplicationService
 from db.s3_sync import S3DatabaseSync
@@ -42,7 +47,7 @@ skipped_profiles = []
 # Global list for analysis/processing errors that resulted in a skip (no Notion upload)
 analysis_errors = []
 
-# Global list for existing profiles updated in Notion because they were stale (>= 28 days since last update)
+# Global list for existing profiles updated in Notion because they were stale (>= 90 days since last update)
 stale_notion_updates = []
 
 # Utility function to check if a file exists
@@ -445,17 +450,45 @@ async def analyze_tweets_with_ai(tweets_file_path, custom_throttler=None):
                 except ValueError:
                     logger.warn(f"Could not parse last_updated_date for @{screen_name}: {last_updated_raw}")
 
+            account_age_days = None
+            created_at_raw = simplified_data.get('profile', {}).get('created_at')
+            if created_at_raw:
+                try:
+                    created_dt = datetime.strptime(created_at_raw, '%a %b %d %H:%M:%S %z %Y')
+                    now_dt = datetime.now(created_dt.tzinfo) if created_dt.tzinfo else datetime.now()
+                    account_age_days = (now_dt - created_dt).days
+                except Exception:
+                    logger.warn(f"Could not parse created_at for @{screen_name}: {created_at_raw}")
+
             if existing_page_id:
-                logger.log(f"Updating existing Notion page for @{screen_name}: {existing_page_id}")
-                notion_response = await update_notion_database_entry(existing_page_id, notion_entry)
-                if days_since_last_update is not None and days_since_last_update >= 28:
+                min_account_age_days_for_recheck = 365
+                recheck_after_days = 90
+                should_recheck_for_pivot = (
+                    days_since_last_update is not None
+                    and days_since_last_update >= recheck_after_days
+                    and account_age_days is not None
+                    and account_age_days >= min_account_age_days_for_recheck
+                )
+                if should_recheck_for_pivot:
+                    logger.log(
+                        f"Updating stale Notion page for @{screen_name} "
+                        f"({days_since_last_update} days, account age {account_age_days} days) "
+                        f"with Date + Research Status: {existing_page_id}"
+                    )
+                    notion_response = await update_notion_date_and_recheck_for_pivot(existing_page_id, notion_entry["date"])
                     stale_notion_updates.append({
                         "username": screen_name,
                         "sourceUsername": simplified_data['sourceUsername'],
                         "notionPageId": existing_page_id,
                         "daysSinceLastUpdate": days_since_last_update,
                         "previousLastUpdatedDate": last_updated_raw,
+                        "action": "set_date_and_research_status_recheck_for_pivot",
+                        "recheckAfterDays": recheck_after_days,
+                        "accountAgeDays": account_age_days,
                     })
+                else:
+                    logger.log(f"Updating existing Notion page for @{screen_name}: {existing_page_id}")
+                    notion_response = await update_notion_database_entry(existing_page_id, notion_entry)
             else:
                 notion_response = await add_notion_database_entry(notion_entry)
 
@@ -725,14 +758,31 @@ async def process_username(username, is_new_username, following_counts):
             screen_name = user.get('screen_name')
             
             # FIRST CHECK: Have we seen this profile before?
-            dedup_check = await DeduplicationService.process_profile(screen_name, username)
+            dedup_check = await DeduplicationService.process_profile(screen_name, username, user.get('created_at'))
             if not dedup_check['isNew']:
-                seen_within_days = dedup_check.get("seenWithinDays", 28)
-                days_since_last_seen = dedup_check.get("daysSinceLastSeen")
-                if days_since_last_seen is not None:
-                    logger.log(f"    Skip @{screen_name} - Seen {days_since_last_seen} days ago (within {seen_within_days}d)")
+                skip_reason = dedup_check.get("skipReason")
+                if skip_reason == "account_too_new_for_recheck":
+                    account_age_days = dedup_check.get("accountAgeDays")
+                    min_age_days = dedup_check.get("minAccountAgeDaysForRecheck", 365)
+                    if account_age_days is not None:
+                        logger.log(
+                            f"    Skip @{screen_name} - Account age {account_age_days}d < {min_age_days}d "
+                            f"(skip until old enough for pivot recheck)"
+                        )
+                    else:
+                        logger.log(
+                            f"    Skip @{screen_name} - Account age < {min_age_days}d "
+                            f"(skip until old enough for pivot recheck)"
+                        )
+                elif skip_reason == "category_profile":
+                    logger.log(f"    Skip @{screen_name} - DB category Profile (permanent)")
                 else:
-                    logger.log(f"    Skip @{screen_name} - Seen within {seen_within_days} days")
+                    seen_within_days = dedup_check.get("seenWithinDays", 90)
+                    days_since_last_seen = dedup_check.get("daysSinceLastSeen")
+                    if days_since_last_seen is not None:
+                        logger.log(f"    Skip @{screen_name} - Seen {days_since_last_seen} days ago (within {seen_within_days}d)")
+                    else:
+                        logger.log(f"    Skip @{screen_name} - Seen within {seen_within_days} days")
                 continue  # Skip to next user
             
             days_since_last_seen = dedup_check.get("daysSinceLastSeen")
@@ -1449,10 +1499,14 @@ async def main():
     logger.log(f"Total Profiles Uploaded to Notion: {total_uploaded}")
     logger.log(f"Total Profiles Skipped: {total_skipped}")
     logger.log(f"Skip Breakdown: Profile={profile_skips}, Other={other_skips}, Error={error_skips}")
-    logger.log(f"Stale Profiles Updated in Notion (>=28d): {len(stale_updates_sorted)}")
+    logger.log(f"Profiles Flagged for Pivot Recheck (>=90d and age>=365d): {len(stale_updates_sorted)}")
     for update in stale_updates_sorted:
         days_since_last_update = update.get("daysSinceLastUpdate")
-        logger.log(f"   - @{update.get('username')} ({days_since_last_update}d)")
+        account_age_days = update.get("accountAgeDays")
+        if account_age_days is not None:
+            logger.log(f"   - @{update.get('username')} ({days_since_last_update}d, age {account_age_days}d)")
+        else:
+            logger.log(f"   - @{update.get('username')} ({days_since_last_update}d)")
 
     if total_processed > 0:
         upload_rate = (total_uploaded / total_processed) * 100
