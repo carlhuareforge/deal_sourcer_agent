@@ -24,24 +24,24 @@ flowchart TB
     COUNTS[get_following_counts()]
     PREV[get_previous_follower_count()]
     PROC[process_username()]
-    FILTER[Dedup and recency filter<br>90 days]
+    FILTER[Dedup and recency filter<br>90 days<br>age gate 365 days]
     COLLECT[collect_tweets_for_new_followers()]
     AI[analyze_tweets_with_ai()]
   end
 
   subgraph External["External services"]
-    RAPID[RapidAPI Twitter endpoints\nUsersByRestIds / FollowingLight / UserTweets]
+    RAPID[RapidAPI Twitter endpoints<br>UsersByRestIds<br>FollowingLight<br>UserTweets]
     OPENAI[OpenAI Chat Completions]
     NOTION[Notion Database API]
-    S3[S3 (optional)]
+    S3[S3 optional]
   end
 
   subgraph Storage["Local storage"]
-    DB[(SQLite: db/twitter_profiles.db)]
-    COUNTSCSV[(follower_counts/*.csv)]
-    RAW[(raw_api_responses/*.json)]
-    TWEETS[(follower_tweets/*_tweets.json)]
-    AIIO[(follower_tweets/ai_tweets/*.json)]
+    DB[SQLite<br>db/twitter_profiles.db]
+    COUNTSCSV[follower_counts files]
+    RAW[raw_api_responses files]
+    TWEETS[follower_tweets<br>tweet files]
+    AIIO[follower_tweets ai_tweets<br>files]
   end
 
   CSV --> MAIN
@@ -159,8 +159,11 @@ Because newly-included handles are only written to the DB after AI triage, the s
 flowchart TD
   Cand[Candidate following user] --> Check[DeduplicationService<br>process_profile]
   Check -->|category == Profile| SkipProfile[Skip personal Profile<br>record source relationship]
-  Check -->|seen < 90d| SkipRecent[Skip seen recently<br>do not bump timestamp]
-  Check -->|new or >= 90d| Include[Include<br>collect tweets and AI]
+  Check --> AgeOK{Account age at least<br>365 days}
+  AgeOK -->|No| SkipYoung[Skip already seen<br>account under 365 days]
+  AgeOK -->|Yes| Recent{Seen in last 90 days}
+  Recent -->|Yes| SkipRecent[Skip seen recently<br>do not bump timestamp]
+  Recent -->|No| Include[Include<br>collect tweets and AI]
 ```
 
 ### Note on configuration vs implementation
@@ -179,7 +182,9 @@ flowchart TD
   Candidate --> Dedup[Check DB dedup<br>and recency window]
   Dedup --> DbProfile{DB says personal Profile}
   DbProfile -->|Yes| SkipPermanent[Skip permanently<br>and record relationship]
-  DbProfile -->|No| Recent{Seen in last 90 days}
+  DbProfile -->|No| AgeOK{Account age at least<br>365 days}
+  AgeOK -->|No| SkipYoung[Skip already seen<br>account under 365 days]
+  AgeOK -->|Yes| Recent{Seen in last 90 days}
   Recent -->|Yes| SkipRecent[Skip for now<br>and do not bump timestamp]
   Recent -->|No| RunDup{Already queued this run}
   RunDup -->|Yes| SkipRunDup[Skip run duplicate]
