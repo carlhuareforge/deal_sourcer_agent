@@ -110,11 +110,18 @@ class Repository:
             
             if existing:
                 # Update existing profile
-                cursor.execute("""
-                    UPDATE processed_profiles 
-                    SET last_updated_date = ?, notion_page_id = ?
-                    WHERE twitter_handle = ?
-                """, (now, notion_page_id, twitter_handle))
+                if notion_page_id is None:
+                    cursor.execute("""
+                        UPDATE processed_profiles
+                        SET last_updated_date = ?
+                        WHERE twitter_handle = ?
+                    """, (now, twitter_handle))
+                else:
+                    cursor.execute("""
+                        UPDATE processed_profiles 
+                        SET last_updated_date = ?, notion_page_id = ?
+                        WHERE twitter_handle = ?
+                    """, (now, notion_page_id, twitter_handle))
             else:
                 # Insert new profile
                 cursor.execute("""

@@ -1,6 +1,7 @@
 import os
 import requests
 import json
+from datetime import datetime
 from utils.logger import logger
 from config import NOTION_API_KEY, NOTION_DATABASE_ID, NOTION_UPLOAD_ENABLED
 
@@ -13,6 +14,84 @@ class NotionClient:
             "Notion-Version": "2022-06-28"
         }
         self.database_id = NOTION_DATABASE_ID
+
+    def _build_entry_properties(self, entry_data, priority=None):
+        properties = {
+            "Name": {
+                "title": [
+                    {
+                        "text": {
+                            "content": entry_data.get('name', 'Unknown')
+                        }
+                    }
+                ]
+            },
+            "Summary": {
+                "rich_text": [
+                    {
+                        "text": {
+                            "content": entry_data.get('summary', '')
+                        }
+                    }
+                ]
+            },
+            "Date": {
+                "date": {
+                    "start": entry_data.get('date', '')
+                }
+            },
+            "Details": {
+                "type": "rich_text",
+                "rich_text": [
+                    {
+                        "type": "text",
+                        "text": {
+                            "content": entry_data.get('content', '')[:1990]  # Limit to 1990 chars like app.js
+                        }
+                    }
+                ]
+            },
+            "Source": {
+                "type": "rich_text",
+                "rich_text": [
+                    {
+                        "type": "text",
+                        "text": {
+                            "content": f"@{entry_data.get('sourceUsername', '')}",
+                            "link": {
+                                "url": f"https://x.com/{entry_data.get('sourceUsername', '')}"
+                            }
+                        }
+                    }
+                ]
+            },
+            "Twitter": {
+                "type": "rich_text",
+                "rich_text": [
+                    {
+                        "type": "text",
+                        "text": {
+                            "content": f"@{entry_data.get('screenName', '')}",
+                            "link": {
+                                "url": f"https://x.com/{entry_data.get('screenName', '')}"
+                            }
+                        }
+                    }
+                ]
+            },
+            "Category": {
+                "multi_select": [
+                    {"name": cat} for cat in entry_data.get('categories', ['Unknown'])
+                ]
+            }
+        }
+
+        # Research workflow fields (if present in database schema)
+        properties["Research Status"] = {"multi_select": []}
+        properties["Research Date"] = {"date": None}
+        properties["Ava's Priority"] = {"select": None}
+
+        return properties
 
     async def initialize_notion_categories(self):
         if not NOTION_UPLOAD_ENABLED:
@@ -95,75 +174,7 @@ class NotionClient:
         logger.log(f"Entry data keys: {list(entry_data.keys())}")
         logger.log(f"Categories: {entry_data.get('categories', [])}")
         
-        properties = {
-            "Name": {
-                "title": [
-                    {
-                        "text": {
-                            "content": entry_data.get('name', 'Unknown')
-                        }
-                    }
-                ]
-            },
-            "Summary": {
-                "rich_text": [
-                    {
-                        "text": {
-                            "content": entry_data.get('summary', '')
-                        }
-                    }
-                ]
-            },
-            "Date": {
-                "date": {
-                    "start": entry_data.get('date', '')
-                }
-            },
-            "Details": {
-                "type": "rich_text",
-                "rich_text": [
-                    {
-                        "type": "text",
-                        "text": {
-                            "content": entry_data.get('content', '')[:1990]  # Limit to 1990 chars like app.js
-                        }
-                    }
-                ]
-            },
-            "Source": {
-                "type": "rich_text",
-                "rich_text": [
-                    {
-                        "type": "text",
-                        "text": {
-                            "content": f"@{entry_data.get('sourceUsername', '')}",
-                            "link": {
-                                "url": f"https://x.com/{entry_data.get('sourceUsername', '')}"
-                            }
-                        }
-                    }
-                ]
-            },
-            "Twitter": {
-                "type": "rich_text",
-                "rich_text": [
-                    {
-                        "type": "text",
-                        "text": {
-                            "content": f"@{entry_data.get('screenName', '')}",
-                            "link": {
-                                "url": f"https://x.com/{entry_data.get('screenName', '')}"
-                            }
-                        }
-                    }
-                ]
-            },
-            "Category": {
-                "multi_select": [
-                    {"name": cat} for cat in entry_data.get('categories', ['Unknown'])
-                ]
-            }
-        }
+        properties = self._build_entry_properties(entry_data)
 
         data = {
             "parent": {"database_id": self.database_id},
@@ -206,6 +217,49 @@ class NotionClient:
             logger.error(f"An unexpected error occurred while adding Notion entry: {e}")
             raise
 
+    async def update_notion_database_entry(self, page_id, entry_data, priority=None):
+        if not NOTION_UPLOAD_ENABLED:
+            logger.log("Notion upload is disabled. Skipping database entry update.")
+            return {"id": page_id or "mock_notion_page_id", "status": "mock_success"}
+        if not page_id:
+            raise ValueError("Notion page_id is required for update.")
+
+        logger.log(f"Attempting to update Notion entry {page_id} for @{entry_data.get('screenName')}")
+
+        properties = self._build_entry_properties(entry_data, priority=priority)
+        data = {"properties": properties}
+
+        try:
+            response = requests.patch(f"{self.base_url}/pages/{page_id}", headers=self.headers, json=data)
+
+            if response.status_code != 200:
+                logger.error(f"Notion API returned status {response.status_code} on update")
+                logger.error(f"Response headers: {dict(response.headers)}")
+                logger.error(f"Response text: {response.text}")
+                try:
+                    error_json = response.json()
+                    logger.error(f"Error JSON: {json.dumps(error_json, indent=2)}")
+                except Exception:
+                    pass
+
+            response.raise_for_status()
+            logger.log(f"Successfully updated Notion entry {page_id} for @{entry_data.get('screenName')}")
+            return response.json()
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error updating Notion database entry {page_id} for @{entry_data.get('screenName')}: {e}")
+            if hasattr(e, 'response') and e.response is not None:
+                try:
+                    error_text = e.response.text
+                    logger.error(f"Notion API full response: {error_text}")
+                    error_details = e.response.json()
+                    logger.error(f"Notion API error details: {json.dumps(error_details, indent=2)}")
+                except Exception as parse_error:
+                    logger.error(f"Could not parse error response: {parse_error}")
+            raise
+        except Exception as e:
+            logger.error(f"An unexpected error occurred while updating Notion entry: {e}")
+            raise
+
 # Initialize a global Notion client instance
 notion_client = NotionClient()
 
@@ -213,3 +267,4 @@ notion_client = NotionClient()
 initialize_notion_categories = notion_client.initialize_notion_categories
 get_existing_categories = notion_client.get_existing_categories
 add_notion_database_entry = notion_client.add_notion_database_entry
+update_notion_database_entry = notion_client.update_notion_database_entry

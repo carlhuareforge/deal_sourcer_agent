@@ -25,10 +25,11 @@ from config import (
 
 from api.twitter_client import TwitterClient, throttled_rapid_api_request
 from api.twitter_parser import simplify_twitter_data, extract_tweets_from_response
-from api.notion_client import initialize_notion_categories, get_existing_categories, add_notion_database_entry
+from api.notion_client import initialize_notion_categories, get_existing_categories, add_notion_database_entry, update_notion_database_entry
 from api.openai_client import get_openai_client, create_throttler
 from services.deduplication_service import DeduplicationService
 from db.s3_sync import S3DatabaseSync
+from db.repository import repository
 # from services.email_service import send_completion_email  # Email functionality disabled
 
 # Initialize clients
@@ -40,6 +41,12 @@ notion_categories = ['Unknown']
 
 # Global list for skipped profiles
 skipped_profiles = []
+
+# Global list for analysis/processing errors that resulted in a skip (no Notion upload)
+analysis_errors = []
+
+# Global list for existing profiles updated in Notion because they were stale (>= 28 days since last update)
+stale_notion_updates = []
 
 # Utility function to check if a file exists
 async def file_exists(file_path):
@@ -129,7 +136,7 @@ async def analyze_tweets_with_ai(tweets_file_path, custom_throttler=None):
     """
     Analyzes tweets and profile with OpenAI, and optionally uploads results to Notion.
     """
-    global skipped_profiles # Declare intent to modify global list
+    global skipped_profiles, analysis_errors, stale_notion_updates # Declare intent to modify global lists
 
     try:
         # 1. Read local JSON (already fetched from Twitter)
@@ -199,7 +206,7 @@ async def analyze_tweets_with_ai(tweets_file_path, custom_throttler=None):
                         messages=[
                             {
                                 "role": "system",
-                                "content": prompt + "\n\nBe extremely strict in classifying firms and individuals as Profile. When in doubt about whether something is a firm (VC/investment entity), classify it as Profile. Apply extra scrutiny to ensure no firm or individual gets misclassified. IMPORTANT: Your response MUST be a valid JSON object with no extra text or formatting before or after it."
+                                "content": prompt,
                             },
                             {"role": "user", "content": json.dumps(current_data, indent=2)}
                         ],
@@ -256,6 +263,11 @@ async def analyze_tweets_with_ai(tweets_file_path, custom_throttler=None):
         
         if not ai_response:
             logger.error('AI returned empty response')
+            analysis_errors.append({
+                "username": screen_name,
+                "file": os.path.basename(tweets_file_path),
+                "reason": "openai_empty_response",
+            })
             return None
 
         logger.log('AI Analysis: Received response')
@@ -285,8 +297,20 @@ async def analyze_tweets_with_ai(tweets_file_path, custom_throttler=None):
                     logger.log('Successfully recovered JSON from response!')
                 except Exception as recovery_error:
                     logger.error(f'Recovery attempt failed: {recovery_error}')
+                    analysis_errors.append({
+                        "username": screen_name,
+                        "file": os.path.basename(tweets_file_path),
+                        "reason": "openai_json_recovery_failed",
+                        "error": str(recovery_error),
+                    })
                     return None
             else:
+                analysis_errors.append({
+                    "username": screen_name,
+                    "file": os.path.basename(tweets_file_path),
+                    "reason": "openai_json_parse_failed",
+                    "error": str(parse_error),
+                })
                 return None
 
         # Save AI response for debugging
@@ -388,13 +412,42 @@ async def analyze_tweets_with_ai(tweets_file_path, custom_throttler=None):
             "categories": final_cats
         }
 
-        # 8. Upload to Notion
+        # 8. Upload/update to Notion
         try:
-            notion_response = await add_notion_database_entry(notion_entry)
+            existing_profile = repository.find_by_handle(screen_name)
+            existing_page_id = existing_profile.get('notion_page_id') if existing_profile else None
+
+            days_since_last_update = None
+            last_updated_raw = existing_profile.get("last_updated_date") if existing_profile else None
+            if last_updated_raw:
+                try:
+                    last_updated_dt = datetime.fromisoformat(last_updated_raw)
+                    now_dt = datetime.now(last_updated_dt.tzinfo) if last_updated_dt.tzinfo else datetime.now()
+                    days_since_last_update = (now_dt - last_updated_dt).days
+                except ValueError:
+                    logger.warn(f"Could not parse last_updated_date for @{screen_name}: {last_updated_raw}")
+
+            if existing_page_id:
+                logger.log(f"Updating existing Notion page for @{screen_name}: {existing_page_id}")
+                notion_response = await update_notion_database_entry(existing_page_id, notion_entry)
+                if days_since_last_update is not None and days_since_last_update >= 28:
+                    stale_notion_updates.append({
+                        "username": screen_name,
+                        "sourceUsername": simplified_data['sourceUsername'],
+                        "notionPageId": existing_page_id,
+                        "daysSinceLastUpdate": days_since_last_update,
+                        "previousLastUpdatedDate": last_updated_raw,
+                    })
+            else:
+                notion_response = await add_notion_database_entry(notion_entry)
+
+            notion_page_id = notion_response.get('id') if isinstance(notion_response, dict) else None
+            if not notion_page_id:
+                notion_page_id = existing_page_id
 
             await DeduplicationService.record_new_profile({
                 "twitter_handle": screen_name,
-                "notion_page_id": notion_response['id']
+                "notion_page_id": notion_page_id
             }, simplified_data['sourceUsername'])
 
             return notion_response
@@ -404,13 +457,18 @@ async def analyze_tweets_with_ai(tweets_file_path, custom_throttler=None):
 
     except Exception as error:
         logger.error(f"Error analyzing tweets for {tweets_file_path}: {error}")
-        
+
+        error_username = None
+        error_source_username = None
         try:
             # Attempt to extract screen_name and source_username for deduplication
             with open(tweets_file_path, 'r', encoding='utf-8') as f:
                 temp_data = json.load(f)
             screen_name = temp_data['profile'].get('screen_name')
             source_username = temp_data.get('sourceUsername', 'unknown')
+
+            error_username = screen_name
+            error_source_username = source_username
             
             if screen_name:
                 logger.log(f"Marking {screen_name} as processed despite error to avoid infinite retry loop")
@@ -420,6 +478,14 @@ async def analyze_tweets_with_ai(tweets_file_path, custom_throttler=None):
                 }, source_username)
         except Exception as record_error:
             logger.error(f"Failed to record error in deduplication service for {tweets_file_path}: {record_error}")
+
+        analysis_errors.append({
+            "username": error_username or "Unknown",
+            "sourceUsername": error_source_username or "unknown",
+            "file": os.path.basename(tweets_file_path),
+            "reason": "analysis_exception",
+            "error": str(error),
+        })
         
         return None
 
@@ -633,55 +699,20 @@ async def process_username(username, is_new_username, following_counts):
             # FIRST CHECK: Have we seen this profile before?
             dedup_check = await DeduplicationService.process_profile(screen_name, username)
             if not dedup_check['isNew']:
-                logger.log(f"    Skip @{screen_name} - Already processed (duplicate)")
+                seen_within_days = dedup_check.get("seenWithinDays", 28)
+                days_since_last_seen = dedup_check.get("daysSinceLastSeen")
+                if days_since_last_seen is not None:
+                    logger.log(f"    Skip @{screen_name} - Seen {days_since_last_seen} days ago (within {seen_within_days}d)")
+                else:
+                    logger.log(f"    Skip @{screen_name} - Seen within {seen_within_days} days")
                 continue  # Skip to next user
             
-            # Only proceed with filtering if this is a new profile
-            follower_count = user.get('followers_count', 0)
-            following_count = user.get('friends_count', 0)
-            created_at_str = user.get('created_at')
-            
-            account_age = 181  # Default to old account (> 180 days)
-            if created_at_str:
-                try:
-                    # Parse date string from Twitter API (e.g., 'Mon Apr 29 00:00:00 +0000 2024')
-                    # Python's datetime.strptime is more robust for this format
-                    created_at_dt = datetime.strptime(created_at_str, '%a %b %d %H:%M:%S %z %Y')
-                    now_est = datetime.now(pytz.timezone('America/New_York'))
-                    # Convert created_at to EST for consistent comparison
-                    created_at_est = created_at_dt.astimezone(pytz.timezone('America/New_York'))
-                    time_diff = now_est - created_at_est
-                    account_age = time_diff.days
-                except ValueError:
-                    logger.warn(f"Could not parse created_at date for @{user.get('screen_name')}: {created_at_str}")
-                    # Keep account_age as default (old) if parsing fails
-
-            is_new_account = account_age <= 180  # Classified as new if account is 180 days old or younger
-            
-            # Determine if we should process this profile
-            # Process if EITHER condition is true:
-            # 1. Both follower and following < 1000
-            # 2. New account (≤180 days old)
-            should_process = (
-                (follower_count < 1000 and following_count < 1000) or
-                is_new_account
-            )
-            
-            if should_process:
-                # We want to process this profile
-                if is_new_account:
-                    logger.log(f"    Include @{screen_name} (Followers: {follower_count}, Following: {following_count}, Age: {account_age} days) - New account")
-                else:
-                    logger.log(f"    Include @{screen_name} (Followers: {follower_count}, Following: {following_count}, Age: {account_age} days) - Both Follower/Following < 1000")
-                filtered_followings.append(user)
+            days_since_last_seen = dedup_check.get("daysSinceLastSeen")
+            if days_since_last_seen is not None:
+                logger.log(f"    Include @{screen_name} - Last seen {days_since_last_seen} days ago")
             else:
-                # Skip this profile but record it in deduplication
-                logger.log(f"    Skip @{screen_name} (Followers: {follower_count}, Following: {following_count}, Age: {account_age} days) - Old account or high counts")
-                # Record this filtered profile so we don't check it again
-                await DeduplicationService.record_new_profile({
-                    "twitter_handle": screen_name,
-                    "notion_page_id": None
-                }, username)  # username is the source_username
+                logger.log(f"    Include @{screen_name}")
+            filtered_followings.append(user)
 
         # Note: We already deduplicate using the database (line 620)
         # No need for file-based deduplication since following_history files are legacy
@@ -1018,7 +1049,12 @@ async def save_follower_counts(count_map):
 # We now use database-based deduplication which is superior
 
 async def main():
-    global notion_categories, skipped_profiles # Declare intent to modify global lists
+    global notion_categories, skipped_profiles, analysis_errors, stale_notion_updates # Declare intent to modify global lists
+
+    # Reset per-run tracking (important for tests or repeated invocations in the same process)
+    skipped_profiles = []
+    analysis_errors = []
+    stale_notion_updates = []
 
     if not RAPID_API_KEY:
         logger.error('RAPID_API_KEY is not set in environment variables')
@@ -1029,6 +1065,7 @@ async def main():
     total_uploaded = 0
     resume_mode = False
     processed_files = []
+    seen_handles = set()
     s3_sync = None
 
     await setup_directories()
@@ -1121,7 +1158,39 @@ async def main():
 
                     # Collect tweets for new followers if any were found
                     if results['followings']:
-                        await collect_tweets_for_new_followers(results['followings'], profile['screen_name'])
+                        followings_to_collect = []
+                        batch_seen = set()
+
+                        for user in results['followings']:
+                            screen_name = user.get('screen_name')
+                            if not screen_name:
+                                followings_to_collect.append(user)
+                                continue
+
+                            handle_key = screen_name.lower()
+
+                            if handle_key in seen_handles:
+                                logger.log(f"    Skip @{screen_name} - Already queued this run")
+                                continue
+
+                            if handle_key in batch_seen:
+                                logger.log(f"    Skip @{screen_name} - Duplicate within this batch")
+                                continue
+
+                            batch_seen.add(handle_key)
+                            followings_to_collect.append(user)
+
+                        if followings_to_collect:
+                            await collect_tweets_for_new_followers(followings_to_collect, profile['screen_name'])
+
+                            for user in followings_to_collect:
+                                screen_name = user.get('screen_name')
+                                if not screen_name:
+                                    continue
+
+                                tweets_file = os.path.join(TWEETS_DIR, f"{screen_name}_tweets.json")
+                                if os.path.exists(tweets_file):
+                                    seen_handles.add(screen_name.lower())
                 except Exception as error:
                     logger.error(f" │ Error processing profile @{profile['screen_name']}: {error}")
                     continue
@@ -1175,6 +1244,13 @@ async def main():
                     except Exception as error:
                         logger.error(f"Error analyzing tweets: {error}")
                         total_skipped += 1
+                        analysis_errors.append({
+                            "username": file.replace("_tweets.json", ""),
+                            "sourceUsername": "unknown",
+                            "file": file,
+                            "reason": "analysis_task_exception",
+                            "error": str(error),
+                        })
                         logger.log(f"[{total_processed}/{len(sorted_files)}] ⏩ Skipped: {file} (error)")
             else:
                 logger.log(f"\nAnalyzing {len(sorted_files)} files concurrently (concurrent processing enabled)")
@@ -1204,6 +1280,13 @@ async def main():
                             return { "file": file, "status": 'success' }
                     except Exception as error:
                         logger.error(f"Error analyzing tweets: {error}")
+                        analysis_errors.append({
+                            "username": file.replace("_tweets.json", ""),
+                            "sourceUsername": "unknown",
+                            "file": file,
+                            "reason": "analysis_task_exception",
+                            "error": str(error),
+                        })
                         logger.log(f"[{file_index + 1}/{len(sorted_files)}] ⏩ Skipped: {file} (error)")
                         return { "file": file, "status": 'error', "reason": 'analysis_error', "error": str(error) }
 
@@ -1217,14 +1300,33 @@ async def main():
                 # JavaScript uses Promise.all() which is equivalent to asyncio.gather()
                 results = await asyncio.gather(*tasks, return_exceptions=True)
 
-                successful_uploads = sum(1 for r in results if r['status'] == 'success')
-                skipped_uploads = sum(1 for r in results if r['status'] == 'skipped')
-                failed_uploads = sum(1 for r in results if r['status'] == 'error')
+                normalized_results = []
+                for r in results:
+                    if isinstance(r, Exception):
+                        analysis_errors.append({
+                            "username": "Unknown",
+                            "sourceUsername": "unknown",
+                            "file": "unknown",
+                            "reason": "analysis_task_exception",
+                            "error": str(r),
+                        })
+                        normalized_results.append({
+                            "file": "unknown",
+                            "status": "error",
+                            "reason": "task_exception",
+                            "error": str(r),
+                        })
+                    else:
+                        normalized_results.append(r)
+
+                successful_uploads = sum(1 for r in normalized_results if r.get("status") == "success")
+                skipped_uploads = sum(1 for r in normalized_results if r.get("status") == "skipped")
+                failed_uploads = sum(1 for r in normalized_results if r.get("status") == "error")
                 
                 # Update totals based on results
-                total_processed = len(results)
+                total_processed = len(normalized_results)
                 total_uploaded = successful_uploads
-                total_skipped = skipped_uploads
+                total_skipped = skipped_uploads + failed_uploads
                 
                 logger.log(f"\nConcurrent processing complete:")
                 logger.log(f"   Total processed: {total_processed}")
@@ -1254,11 +1356,29 @@ async def main():
             logger.log(f"   Categories: {profile['categories']}")
             logger.log(f"   Bio: {description[:100]}{ '...' if len(description) > 100 else ''}")
 
+    profile_skips = sum(
+        1 for profile in skipped_profiles if (profile.get("reason") or "").strip().lower() == "profile"
+    )
+    error_skips = len(analysis_errors)
+    other_skips = max(total_skipped - profile_skips - error_skips, 0)
+
+    stale_updates_sorted = sorted(
+        stale_notion_updates,
+        key=lambda u: u.get("daysSinceLastUpdate") or 0,
+        reverse=True,
+    )
+
     logger.log(f"\n📈 FINAL RUN SUMMARY:")
     logger.log(f"───────────────────────────────────────")
     logger.log(f"Total Profiles Processed: {total_processed}")
     logger.log(f"Total Profiles Uploaded to Notion: {total_uploaded}")
     logger.log(f"Total Profiles Skipped: {total_skipped}")
+    logger.log(f"Skip Breakdown: Profile={profile_skips}, Other={other_skips}, Error={error_skips}")
+    logger.log(f"Stale Profiles Updated in Notion (>=28d): {len(stale_updates_sorted)}")
+    for update in stale_updates_sorted:
+        days_since_last_update = update.get("daysSinceLastUpdate")
+        logger.log(f"   - @{update.get('username')} ({days_since_last_update}d)")
+
     if total_processed > 0:
         upload_rate = (total_uploaded / total_processed) * 100
         skip_rate = (total_skipped / total_processed) * 100
@@ -1285,7 +1405,13 @@ async def main():
         "totalProcessed": total_processed,
         "totalSkipped": total_skipped,
         "totalUploaded": total_uploaded,
-        "errors": [] # Placeholder for collecting errors
+        "skipBreakdown": {
+            "profile": profile_skips,
+            "other": other_skips,
+            "error": error_skips,
+        },
+        "staleNotionUpdates": stale_updates_sorted,
+        "errors": analysis_errors,
     }
 
 async def get_file_complexity(file_path):
