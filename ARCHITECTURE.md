@@ -156,73 +156,43 @@ Because newly-included handles are only written to the DB after AI triage, the s
 
 ```mermaid
 flowchart TD
-  Cand[Candidate following user] --> Check[DeduplicationService.process_profile()]
-  Check -->|category == Profile| SkipProfile[Skip (Profile)\nrecord source relationship]
-  Check -->|seen < 28d| SkipRecent[Skip (seen recently)\nno last_updated bump]
-  Check -->|new or >= 28d| Include[Include\ncollect tweets + AI]
+  Cand[Candidate following user] --> Check[DeduplicationService<br>process_profile]
+  Check -->|category == Profile| SkipProfile[Skip personal Profile<br>record source relationship]
+  Check -->|seen < 28d| SkipRecent[Skip seen recently<br>do not bump timestamp]
+  Check -->|new or >= 28d| Include[Include<br>collect tweets and AI]
 ```
 
 ### Note on configuration vs implementation
 
 The recency window is currently hard-coded as `28` days in `services/deduplication_service.py`. If you want it configurable, wire it to `config.py` and use it in both the dedup check and the “stale Notion update” reporting.
 
-## End-to-End Flow Diagram (Twitter → Tweets → AI → Notion)
+## End-to-End Flow Diagram Twitter to AI to Notion
 
 ```mermaid
 flowchart TD
-  Start([Start]) --> Setup[Load config / ensure dirs]
-  Setup --> S3{USE_S3_SYNC?}
-  S3 -->|Yes| S3DL[Smart-download DB + follower counts]
-  S3 -->|No| Seed[Read input_usernames.csv]
-  S3DL --> Seed
+  Source[Source account<br>from input_usernames.csv] --> SourceEligible{Source produced candidates}
+  SourceEligible -->|No| StopSource[Stop for this source]
+  SourceEligible -->|Yes| Candidates[Fetch recent followings]
 
-  Seed --> NotionCats[Initialize Notion categories\n(get_existing_categories)]
-  NotionCats --> Counts[RapidAPI UsersByRestIds\nget following counts]
+  Candidates --> Candidate[Candidate profile]
+  Candidate --> Dedup[Check DB dedup<br>and recency window]
+  Dedup --> DbProfile{DB says personal Profile}
+  DbProfile -->|Yes| SkipPermanent[Skip permanently<br>and record relationship]
+  DbProfile -->|No| Recent{Seen in last 28 days}
+  Recent -->|Yes| SkipRecent[Skip for now<br>and do not bump timestamp]
+  Recent -->|No| RunDup{Already queued this run}
+  RunDup -->|Yes| SkipRunDup[Skip run duplicate]
+  RunDup -->|No| Tweets[Collect sample tweets]
 
-  Counts --> SrcLoop{{For each source account}}
-  SrcLoop --> Prev[Read previous count from follower_counts/*.csv]
-  Prev --> Baseline{Previous count exists?}
-  Baseline -->|No| BaselineOnly[Baseline only\n(no followings fetched)] --> SrcLoop
+  Tweets --> AI[Send to AI<br>for classification]
+  AI --> AIError{AI or parse error}
+  AIError -->|Yes| RecordError[Record in DB<br>with no Notion id]
+  AIError -->|No| Triage[Decide whether<br>to upload to Notion]
 
-  Baseline -->|Yes| Diff{count_diff == 0?}
-  Diff -->|Yes| NoChange[Skip source (no changes)] --> SrcLoop
-
-  Diff -->|No| Followings[RapidAPI FollowingLight\nfetch recent followings]
-  Followings --> Protected{Protected / not authorized?}
-  Protected -->|Yes| SkipProtected[Skip source] --> SrcLoop
-
-  Protected -->|No| CandLoop{{For each candidate following}}
-  CandLoop --> Dedup{DB dedup + 28d recency?\n(DeduplicationService.process_profile)}
-  Dedup -->|category=Profile| SkipProfile[Skip candidate (Profile)] --> CandLoop
-  Dedup -->|seen < 28d| SkipRecent[Skip candidate (recent)] --> CandLoop
-  Dedup -->|new or >=28d| RunDup{Already queued this run?\n(seen_handles / batch_seen)}
-  RunDup -->|Yes| SkipRunDup[Skip candidate (run duplicate)] --> CandLoop
-
-  RunDup -->|No| Tweets[RapidAPI UserTweets\n(paginate; fallback UserTweetsAndReplies)]
-  Tweets --> WriteTweets[Write follower_tweets/*_tweets.json\n+ raw_api_responses/*.json] --> CandLoop
-
-  SrcLoop --> SaveCounts[Write new follower_counts_*.csv]
-  SaveCounts --> Files[Find tweet files\nsort by complexity]
-  Files --> FileLoop{{For each tweet file}}
-
-  FileLoop --> OpenAI[OpenAI classify (JSON object)]
-  OpenAI --> AIError{AI/parse/Notion error?}
-  AIError -->|Yes| MarkError[Record analysis error\nrecord_new_profile(notion_page_id=None)] --> FileLoop
-
-  AIError -->|No| Triage{Profile-only or meme/NFT?}
-  Triage -->|Yes| SkipNotion[Skip Notion\nrecord_new_profile(category=Profile)] --> FileLoop
-
-  Triage -->|No| NotionOn{NOTION_UPLOAD_ENABLED?}
-  NotionOn -->|No| MockNotion[Skip network call\n(mock Notion response)] --> RecordProject
-
-  NotionOn -->|Yes| ExistingPage{Existing notion_page_id?}
-  ExistingPage -->|No| CreatePage[Create Notion page] --> RecordProject
-  ExistingPage -->|Yes| UpdatePage[Update Notion page] --> Stale{days since last update >= 28?}
-  Stale -->|Yes| TrackStale[Add to stale update list] --> RecordProject
-  Stale -->|No| RecordProject
-
-  RecordProject[record_new_profile(category=Project)] --> FileLoop
-
-  FileLoop --> Summary[Final run summary log\n(processed/uploaded/skipped)\n+ skip breakdown + stale updates]
-  Summary --> End([End])
+  Triage --> SkipNotion{Skip Notion<br>based on categories}
+  SkipNotion -->|Yes| RecordSkipNotion[Record in DB as Profile]
+  SkipNotion -->|No| NotionEnabled{Notion upload enabled}
+  NotionEnabled -->|No| RecordNoUpload[Record in DB<br>with no Notion id]
+  NotionEnabled -->|Yes| Upsert[Create or update<br>Notion page]
+  Upsert --> RecordProject[Record in DB<br>with Notion page id]
 ```
