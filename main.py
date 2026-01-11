@@ -50,6 +50,9 @@ analysis_errors = []
 # Global list for existing profiles updated in Notion because they were stale (>= 90 days since last update)
 stale_notion_updates = []
 
+# Global counters for discovery filtering decisions (dedup + in-run duplicates)
+discovery_filter_stats = {}
+
 # Utility function to check if a file exists
 async def file_exists(file_path):
     return os.path.exists(file_path)
@@ -640,6 +643,7 @@ async def process_username(username, is_new_username, following_counts):
     """
     Processes a single username's following changes.
     """
+    global discovery_filter_stats
     try:
         current_count = following_counts.get(username.lower(), 0)
         previous_count = await get_previous_follower_count(username)
@@ -647,6 +651,7 @@ async def process_username(username, is_new_username, following_counts):
 
         if is_new_username:
             logger.log(' | Baseline')
+            discovery_filter_stats["source_baseline"] = discovery_filter_stats.get("source_baseline", 0) + 1
             return {
                 "total": current_count,
                 "new": 0,
@@ -656,6 +661,7 @@ async def process_username(username, is_new_username, following_counts):
 
         if count_diff == 0 and not is_new_username:
             logger.log(f"No following count change for @{username}, skipping")
+            discovery_filter_stats["source_no_change"] = discovery_filter_stats.get("source_no_change", 0) + 1
             return {
                 "total": current_count,
                 "new": 0,
@@ -676,6 +682,7 @@ async def process_username(username, is_new_username, following_counts):
 
                 if response['data'] and response['data'].get('error') == "Not authorized.":
                     logger.log('Profile is private')
+                    discovery_filter_stats["source_not_authorized"] = discovery_filter_stats.get("source_not_authorized", 0) + 1
                     return { "total": current_count, "new": 0, "previousCount": previous_count, "followings": [] }
 
                 if not response['data'] or not response['data'].get('users'):
@@ -696,6 +703,7 @@ async def process_username(username, is_new_username, following_counts):
 
                 if protected:
                     logger.log('Protected account; skipping')
+                    discovery_filter_stats["source_not_authorized"] = discovery_filter_stats.get("source_not_authorized", 0) + 1
                     return { "total": current_count, "new": 0, "previousCount": previous_count, "followings": [] }
 
                 last_error = error
@@ -752,6 +760,7 @@ async def process_username(username, is_new_username, following_counts):
             raise ValueError('API returned no followings')
 
         limited_followings = followings[:fetch_count]
+        discovery_filter_stats["candidates_considered"] = discovery_filter_stats.get("candidates_considered", 0) + len(limited_followings)
 
         filtered_followings = []
         for user in limited_followings:
@@ -761,6 +770,8 @@ async def process_username(username, is_new_username, following_counts):
             dedup_check = await DeduplicationService.process_profile(screen_name, username, user.get('created_at'))
             if not dedup_check['isNew']:
                 skip_reason = dedup_check.get("skipReason")
+                skip_key = f"dedup_skip_{skip_reason or 'unknown'}"
+                discovery_filter_stats[skip_key] = discovery_filter_stats.get(skip_key, 0) + 1
                 if skip_reason == "account_too_new_for_recheck":
                     account_age_days = dedup_check.get("accountAgeDays")
                     min_age_days = dedup_check.get("minAccountAgeDaysForRecheck", 365)
@@ -785,6 +796,11 @@ async def process_username(username, is_new_username, following_counts):
                         logger.log(f"    Skip @{screen_name} - Seen within {seen_within_days} days")
                 continue  # Skip to next user
             
+            if dedup_check.get("profile"):
+                discovery_filter_stats["dedup_include_reprocess"] = discovery_filter_stats.get("dedup_include_reprocess", 0) + 1
+            else:
+                discovery_filter_stats["dedup_include_new"] = discovery_filter_stats.get("dedup_include_new", 0) + 1
+
             days_since_last_seen = dedup_check.get("daysSinceLastSeen")
             if days_since_last_seen is not None:
                 logger.log(f"    Include @{screen_name} - Last seen {days_since_last_seen} days ago")
@@ -1175,12 +1191,13 @@ async def save_follower_counts(count_map):
 # We now use database-based deduplication which is superior
 
 async def main():
-    global skipped_profiles, analysis_errors, stale_notion_updates # Declare intent to modify global lists
+    global skipped_profiles, analysis_errors, stale_notion_updates, discovery_filter_stats # Declare intent to modify global lists
 
     # Reset per-run tracking (important for tests or repeated invocations in the same process)
     skipped_profiles = []
     analysis_errors = []
     stale_notion_updates = []
+    discovery_filter_stats = {}
 
     if not RAPID_API_KEY:
         logger.error('RAPID_API_KEY is not set in environment variables')
@@ -1296,10 +1313,12 @@ async def main():
 
                             if handle_key in seen_handles:
                                 logger.log(f"    Skip @{screen_name} - Already queued this run")
+                                discovery_filter_stats["run_skip_already_queued"] = discovery_filter_stats.get("run_skip_already_queued", 0) + 1
                                 continue
 
                             if handle_key in batch_seen:
                                 logger.log(f"    Skip @{screen_name} - Duplicate within this batch")
+                                discovery_filter_stats["run_skip_batch_duplicate"] = discovery_filter_stats.get("run_skip_batch_duplicate", 0) + 1
                                 continue
 
                             batch_seen.add(handle_key)
@@ -1481,11 +1500,18 @@ async def main():
             logger.log(f"   Categories: {profile['categories']}")
             logger.log(f"   Bio: {description[:100]}{ '...' if len(description) > 100 else ''}")
 
-    profile_skips = sum(
-        1 for profile in skipped_profiles if (profile.get("reason") or "").strip().lower() == "profile"
-    )
-    error_skips = len(analysis_errors)
-    other_skips = max(total_skipped - profile_skips - error_skips, 0)
+    triage_skip_counts = {}
+    for profile in skipped_profiles:
+        reason = (profile.get("reason") or "Unknown").strip() or "Unknown"
+        triage_skip_counts[reason] = triage_skip_counts.get(reason, 0) + 1
+
+    error_skip_counts = {}
+    for err in analysis_errors:
+        reason = (err.get("reason") or "unknown_error").strip() or "unknown_error"
+        error_skip_counts[reason] = error_skip_counts.get(reason, 0) + 1
+
+    categorized_skips = len(skipped_profiles) + len(analysis_errors)
+    uncategorized_skips = max(total_skipped - categorized_skips, 0)
 
     stale_updates_sorted = sorted(
         stale_notion_updates,
@@ -1498,7 +1524,34 @@ async def main():
     logger.log(f"Total Profiles Processed: {total_processed}")
     logger.log(f"Total Profiles Uploaded to Notion: {total_uploaded}")
     logger.log(f"Total Profiles Skipped: {total_skipped}")
-    logger.log(f"Skip Breakdown: Profile={profile_skips}, Other={other_skips}, Error={error_skips}")
+
+    if triage_skip_counts:
+        triage_items = sorted(
+            triage_skip_counts.items(),
+            key=lambda kv: (0 if kv[0].strip().lower() == "profile" else 1, -kv[1], kv[0].lower()),
+        )
+        logger.log(f"Skip Breakdown AI Triage: {', '.join(f'{k}={v}' for k, v in triage_items)}")
+    else:
+        logger.log("Skip Breakdown AI Triage: 0")
+
+    if error_skip_counts:
+        error_items = sorted(error_skip_counts.items(), key=lambda kv: (-kv[1], kv[0].lower()))
+        logger.log(f"Skip Breakdown Errors: {', '.join(f'{k}={v}' for k, v in error_items)}")
+    else:
+        logger.log("Skip Breakdown Errors: 0")
+
+    if uncategorized_skips:
+        logger.log(f"Skip Breakdown Uncategorized: {uncategorized_skips}")
+
+    dedup_seen_recently = discovery_filter_stats.get("dedup_skip_seen_recently", 0)
+    dedup_under_one_year = discovery_filter_stats.get("dedup_skip_account_too_new_for_recheck", 0)
+    dedup_db_profile = discovery_filter_stats.get("dedup_skip_category_profile", 0)
+    logger.log(
+        "Discovery Filter Skips: "
+        f"seen_recently={dedup_seen_recently}, "
+        f"under_1_year={dedup_under_one_year}, "
+        f"db_profile={dedup_db_profile}"
+    )
     logger.log(f"Profiles Flagged for Pivot Recheck (>=90d and age>=365d): {len(stale_updates_sorted)}")
     for update in stale_updates_sorted:
         days_since_last_update = update.get("daysSinceLastUpdate")
@@ -1530,6 +1583,12 @@ async def main():
             logger.error(f"Failed to upload to S3: {e}")
             # Don't fail the entire run if S3 upload fails
     
+    profile_skips = sum(
+        count for reason, count in triage_skip_counts.items() if reason.strip().lower() == "profile"
+    )
+    error_skips = sum(error_skip_counts.values())
+    other_skips = max(total_skipped - profile_skips - error_skips, 0)
+
     return {
         "totalProcessed": total_processed,
         "totalSkipped": total_skipped,
@@ -1538,6 +1597,16 @@ async def main():
             "profile": profile_skips,
             "other": other_skips,
             "error": error_skips,
+            "aiTriage": triage_skip_counts,
+            "errorsByReason": error_skip_counts,
+            "uncategorized": uncategorized_skips,
+            "discoveryFilterSkips": {
+                "seen_recently": discovery_filter_stats.get("dedup_skip_seen_recently", 0),
+                "under_1_year": discovery_filter_stats.get("dedup_skip_account_too_new_for_recheck", 0),
+                "db_profile": discovery_filter_stats.get("dedup_skip_category_profile", 0),
+                "already_queued": discovery_filter_stats.get("run_skip_already_queued", 0),
+                "batch_duplicate": discovery_filter_stats.get("run_skip_batch_duplicate", 0),
+            },
         },
         "staleNotionUpdates": stale_updates_sorted,
         "errors": analysis_errors,
