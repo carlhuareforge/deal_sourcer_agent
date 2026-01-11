@@ -101,8 +101,8 @@ async def test_get_following_counts(mock_throttled_request, fake_fs):
     mock_throttled_request.return_value = {
         "data": {
             "users": [
-                {"result": {"legacy": {"screen_name": "johndoe", "friends_count": 100}}},
-                {"result": {"legacy": {"screen_name": "janedoe", "friends_count": 200}}},
+                {"result": {"core": {"screen_name": "johndoe"}, "relationship_counts": {"following": 100}}},
+                {"result": {"core": {"screen_name": "janedoe"}, "relationship_counts": {"following": 200}}},
             ]
         }
     }
@@ -250,31 +250,32 @@ async def test_analyze_tweets_ai_upload(mock_create_throttler, mock_prepare_prom
 @patch("main.add_notion_database_entry", new_callable=AsyncMock)
 @patch("main.get_existing_categories", new_callable=AsyncMock, return_value=["VC", "Profile"])
 @patch("api.openai_client.get_openai_client")
-@patch("main.throttled_rapid_api_request")
+@patch("main.throttled_rapid_api_request", new_callable=AsyncMock)
 async def test_main_workflow_end_to_end(mock_throttled_request, mock_openai_client_get, mock_get_cats, mock_add_notion, mock_send_email, fake_fs, mock_env):
     """Test the full main() workflow with mocks."""
     main.skipped_profiles = []
+
     # --- Mock Twitter Client ---
-    def twitter_side_effect(func):
-        if "get_users_by_rest_ids" in str(func):
-            return {
-                "data": {"users": [
-                    {"result": {"legacy": {"screen_name": "johndoe", "friends_count": 102}}},
-                    {"result": {"legacy": {"screen_name": "janedoe", "friends_count": 200}}},
-                ]}
-            }
-        if "get_following" in str(func):
-            return {
-                "data": {"users": [
-                    {"screen_name": "new_follow_vc", "id_str": "1001", "followers_count": 500, "friends_count": 500, "created_at": "Mon Apr 29 00:00:00 +0000 2024"},
-                    {"screen_name": "new_follow_profile", "id_str": "1002", "followers_count": 500, "friends_count": 500, "created_at": "Mon Apr 29 00:00:00 +0000 2024"},
-                ]}
-            }
-        if "get_user_tweets" in str(func):
-            return {"data": {"tweets": [{"text": "a tweet"}]}}
-        return {}
-    
-    mock_throttled_request.side_effect = lambda func: asyncio.Future()._result_or_cancel(twitter_side_effect(func))
+    mock_get_users_by_rest_ids = AsyncMock(return_value={
+        "data": {"users": [
+            {"result": {"core": {"screen_name": "johndoe"}, "relationship_counts": {"following": 102}}},
+            {"result": {"core": {"screen_name": "janedoe"}, "relationship_counts": {"following": 200}}},
+        ]}
+    })
+    mock_get_following = AsyncMock(return_value={
+        "data": {"users": [
+            {"screen_name": "new_follow_vc", "id_str": "1001", "followers_count": 500, "friends_count": 500, "created_at": "Mon Apr 29 00:00:00 +0000 2024"},
+            {"screen_name": "new_follow_profile", "id_str": "1002", "followers_count": 500, "friends_count": 500, "created_at": "Mon Apr 29 00:00:00 +0000 2024"},
+        ]}
+    })
+    mock_get_user_tweets = AsyncMock(return_value={"data": {"tweet_results": [{"full_text": "a tweet"}]}})
+    mock_get_user_tweets_and_replies = AsyncMock(return_value={"data": {"tweet_results": [{"full_text": "a reply tweet"}]}})
+
+    async def throttled_side_effect(func):
+        result = func()
+        if asyncio.iscoroutine(result):
+            return await result
+        return result
 
 
     # --- Mock OpenAI Client ---
@@ -306,9 +307,15 @@ async def test_main_workflow_end_to_end(mock_throttled_request, mock_openai_clie
     )
 
     # --- Run the workflow ---
-    with patch("main.DeduplicationService.process_profile", new_callable=AsyncMock, return_value={"isNew": True}):
-         with patch("main.DeduplicationService.record_new_profile", new_callable=AsyncMock):
-            stats = await main_workflow()
+    with patch.object(main.twitter_client, "get_users_by_rest_ids", mock_get_users_by_rest_ids), \
+         patch.object(main.twitter_client, "get_following", mock_get_following), \
+         patch.object(main.twitter_client, "get_user_tweets", mock_get_user_tweets), \
+         patch.object(main.twitter_client, "get_user_tweets_and_replies", mock_get_user_tweets_and_replies), \
+         patch("main.DeduplicationService.process_profile", new_callable=AsyncMock, return_value={"isNew": True}), \
+         patch("main.DeduplicationService.record_new_profile", new_callable=AsyncMock):
+
+        mock_throttled_request.side_effect = throttled_side_effect
+        stats = await main_workflow()
 
     # --- Assertions ---
     assert stats["totalProcessed"] == 2

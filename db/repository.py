@@ -90,7 +90,7 @@ class Repository:
             if conn:
                 conn.close()
 
-    def record_new_profile(self, twitter_handle, notion_page_id, source_username):
+    def record_new_profile(self, twitter_handle, notion_page_id, source_username, category=None):
         """
         Records a new profile or updates an existing one.
         Uses the two-table structure: processed_profiles and source_relationships
@@ -105,7 +105,7 @@ class Repository:
             now = datetime.now().isoformat()
             
             # Check if profile already exists
-            cursor.execute("SELECT twitter_handle FROM processed_profiles WHERE twitter_handle = ?", (twitter_handle,))
+            cursor.execute("SELECT twitter_handle, category FROM processed_profiles WHERE twitter_handle = ?", (twitter_handle,))
             existing = cursor.fetchone()
             
             if existing:
@@ -113,22 +113,22 @@ class Repository:
                 if notion_page_id is None:
                     cursor.execute("""
                         UPDATE processed_profiles
-                        SET last_updated_date = ?
+                        SET last_updated_date = ?, category = COALESCE(?, category)
                         WHERE twitter_handle = ?
-                    """, (now, twitter_handle))
+                    """, (now, category, twitter_handle))
                 else:
                     cursor.execute("""
                         UPDATE processed_profiles 
-                        SET last_updated_date = ?, notion_page_id = ?
+                        SET last_updated_date = ?, notion_page_id = ?, category = COALESCE(?, category)
                         WHERE twitter_handle = ?
-                    """, (now, notion_page_id, twitter_handle))
+                    """, (now, notion_page_id, category, twitter_handle))
             else:
                 # Insert new profile
                 cursor.execute("""
                     INSERT INTO processed_profiles 
                     (twitter_handle, first_discovered_date, last_updated_date, notion_page_id, category)
-                    VALUES (?, ?, ?, ?, NULL)
-                """, (twitter_handle, now, now, notion_page_id))
+                    VALUES (?, ?, ?, ?, ?)
+                """, (twitter_handle, now, now, notion_page_id, category))
             
             # Record source relationship
             cursor.execute("""

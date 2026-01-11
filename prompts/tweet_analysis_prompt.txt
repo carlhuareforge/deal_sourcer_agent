@@ -83,6 +83,8 @@ If ANY of these are true, set categories = ["Profile"] and STOP, DO NOT populate
       - The account mainly reposts/translates content from a main account
 
    D. **ADDITIONAL EXCLUSION CRITERIA** - Also set `categories = ["Profile"]` for:
+      - Ovbiously not related to blockchain, AI, Robotics, tech compaines.
+      - Political orgranizations
       - Educational content creators, influencers, or KOLs (Key Opinion Leaders)
       - News aggregators, alert bots, or information services
       - Community managers or moderators

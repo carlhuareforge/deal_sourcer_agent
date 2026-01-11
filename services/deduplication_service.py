@@ -16,6 +16,18 @@ class DeduplicationService:
         existing_profile = repository.find_by_handle(twitter_handle)
         
         if existing_profile:
+            category = existing_profile.get("category")
+            if category and category.lower() == "profile":
+                repository.add_source_relationship(twitter_handle, source_username)
+                sources = repository.get_sources_for_profile(twitter_handle)
+                return {
+                    "isNew": False,
+                    "profile": existing_profile,
+                    "sources": sources,
+                    "daysSinceLastSeen": 0,
+                    "seenWithinDays": 28
+                }
+
             # Add new source relationship
             repository.add_source_relationship(twitter_handle, source_username)
             
@@ -68,13 +80,14 @@ class DeduplicationService:
         """
         twitter_handle = profile_data.get('twitter_handle')
         notion_page_id = profile_data.get('notion_page_id')
+        category = profile_data.get('category')
         
         if not twitter_handle:
             logger.error("Cannot record new profile: 'twitter_handle' is missing.")
             return
 
         try:
-            repository.record_new_profile(twitter_handle, notion_page_id, source_username)
+            repository.record_new_profile(twitter_handle, notion_page_id, source_username, category=category)
             logger.debug(f"Deduplication service recorded @{twitter_handle} (source: {source_username}) with Notion ID: {notion_page_id}")
         except Exception as e:
             logger.error(f"Error recording profile @{twitter_handle} in deduplication service: {e}")

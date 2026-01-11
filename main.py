@@ -379,7 +379,8 @@ async def analyze_tweets_with_ai(tweets_file_path, custom_throttler=None):
 
             await DeduplicationService.record_new_profile({
                 "twitter_handle": screen_name,
-                "notion_page_id": None
+                "notion_page_id": None,
+                "category": "Profile"
             }, simplified_data['sourceUsername'])
 
             return None
@@ -447,7 +448,8 @@ async def analyze_tweets_with_ai(tweets_file_path, custom_throttler=None):
 
             await DeduplicationService.record_new_profile({
                 "twitter_handle": screen_name,
-                "notion_page_id": notion_page_id
+                "notion_page_id": notion_page_id,
+                "category": "Project"
             }, simplified_data['sourceUsername'])
 
             return notion_response
@@ -516,20 +518,29 @@ async def get_following_counts(profiles):
                     logger.log(f"API response status: {response.get('status', 'No status')}")
                     logger.log(f"API response data keys: {list(response.get('data', {}).keys()) if response.get('data') else 'No data'}")
                     
-                    # Check if response has the expected structure
-                    if response.get('data') and 'data' in response['data']:
-                        # Double nested data structure
-                        actual_data = response['data']['data']
-                        if actual_data and actual_data.get('users'):
-                            response['data'] = actual_data  # Flatten the structure
-                    
-                    if response['data'] and response['data'].get('users'):
-                        for user in response['data']['users']:
-                            if user.get('result') and user['result'].get('legacy'):
-                                screen_name = user['result']['legacy']['screen_name'].lower()
-                                following_count = user['result']['legacy']['friends_count']
-                                count_map[screen_name] = following_count
-                                logger.log(f"{screen_name}: {following_count} followings")
+                    users_block = None
+                    data_layer = response.get('data')
+                    if data_layer:
+                        if data_layer.get('users'):
+                            users_block = data_layer['users']
+                        elif isinstance(data_layer, dict) and data_layer.get('data') and data_layer['data'].get('users'):
+                            users_block = data_layer['data']['users']
+
+                    if users_block:
+                        for user in users_block:
+                            result = user.get('result') or {}
+                            core = result.get('core') or {}
+                            rel_counts = result.get('relationship_counts') or {}
+
+                            screen_name = core.get('screen_name')
+                            following_count = rel_counts.get('following')
+
+                            if screen_name is None or following_count is None:
+                                continue
+
+                            screen_name_key = screen_name.lower()
+                            count_map[screen_name_key] = following_count
+                            logger.log(f"{screen_name_key}: {following_count} followings")
                         success = True
                     else:
                         raise ValueError('No users data in response')
@@ -766,68 +777,97 @@ async def collect_tweets_for_new_followers(new_followings, source_username):
                     error_count += 1
                     return { "user": user, "status": 'error', "reason": 'no_user_id' }
 
+                desired_tweet_target = 5
                 tweets = []
                 timeline_response = None
                 is_retryable_error = False
 
+                def find_bottom_cursor(payload):
+                    """
+                    Recursively search the timeline payload for the Bottom cursor value.
+                    """
+                    if isinstance(payload, dict):
+                        if payload.get('__typename') == 'TimelineTimelineCursor' and payload.get('cursor_type') == 'Bottom':
+                            return payload.get('value')
+                        for value in payload.values():
+                            cursor = find_bottom_cursor(value)
+                            if cursor:
+                                return cursor
+                    elif isinstance(payload, list):
+                        for item in payload:
+                            cursor = find_bottom_cursor(item)
+                            if cursor:
+                                return cursor
+                    return None
+
                 try:
-                        logger.log(f"Fetching tweets for @{user.get('screen_name')} using UserTweets endpoint")
-                        user_tweets_params = {
-                            'id': user_id,
-                            'count': '5'
-                        }
-                        logger.log(f"UserTweets API call parameters: {json.dumps(user_tweets_params)}")
-                        logger.log(f"User ID being used: {user_id} (type: {type(user_id)})")
-                        
-                        timeline_response = await throttled_rapid_api_request(lambda: twitter_client.get_user_tweets(user_id, '5'))
-                        
-                        logger.log(f"UserTweets API raw response status: {timeline_response.get('status')}")
-                        logger.log(f"UserTweets API raw response headers: {json.dumps(timeline_response.get('headers'))}")
-                        logger.log(f"UserTweets API response keys: {list(timeline_response.get('data', {}).keys())}")
-                        if timeline_response.get('data') and timeline_response['data'].get('status') and timeline_response['data']['status'] != 'ok':
-                            logger.log(f"UserTweets API error response: {json.dumps(timeline_response['data'])}")
+                    logger.log(f"Fetching tweets for @{user.get('screen_name')} using UserTweets endpoint")
+                    timeline_response = await throttled_rapid_api_request(lambda: twitter_client.get_user_tweets(user_id))
 
-                        if timeline_response.get('data') and timeline_response['data'].get('error'):
-                            logger.error(f"API returned error for @{user.get('screen_name')}: {timeline_response['data']['error']}")
-                            logger.error(f"Status code: {timeline_response['data'].get('statusCode') or timeline_response.get('status')}")
-                            raise ValueError(f"API error: {timeline_response['data']['error']}")
+                    logger.log(f"UserTweets API raw response status: {timeline_response.get('status')}")
+                    logger.log(f"UserTweets API raw response headers: {json.dumps(timeline_response.get('headers'))}")
+                    logger.log(f"UserTweets API response keys: {list(timeline_response.get('data', {}).keys())}")
 
-                        tweets = extract_tweets_from_response(timeline_response['data'])
-                        logger.log(f"Retrieved {len(tweets)} tweets from UserTweets endpoint for @{user.get('screen_name')}")
-                        
-                        raw_response_file = os.path.join(RAW_RESPONSES_DIR, f"{user.get('screen_name')}_raw_response_UserTweets_{datetime.now().isoformat().replace(':', '-').replace('.', '-')}.json")
-                        with open(raw_response_file, 'w', encoding='utf-8') as f:
-                            json.dump(timeline_response['data'], f, indent=2)
-                        logger.log(f"Saved raw UserTweets response to {raw_response_file}")
-                        
-                except requests.exceptions.HTTPError as error:
-                        is_retryable_error = error.response and error.response.status_code in [500, 503, 504]
-                        if is_retryable_error:
-                            logger.warn(f"UserTweets endpoint failed with status {error.response.status_code}, retrying with UserTweetsAndReplies...")
+                    timeline_data = timeline_response.get('data')
+                    if timeline_data and timeline_data.get('status') and timeline_data.get('status') != 'ok':
+                        logger.log(f"UserTweets API error response: {json.dumps(timeline_data)}")
+
+                    if timeline_data and timeline_data.get('error'):
+                        logger.error(f"API returned error for @{user.get('screen_name')}: {timeline_data['error']}")
+                        logger.error(f"Status code: {timeline_data.get('statusCode') or timeline_response.get('status')}")
+                        raise ValueError(f"API error: {timeline_data['error']}")
+
+                    tweets = extract_tweets_from_response(timeline_data)
+                    logger.log(f"Retrieved {len(tweets)} tweets from UserTweets endpoint for @{user.get('screen_name')}")
+
+                    raw_response_file = os.path.join(RAW_RESPONSES_DIR, f"{user.get('screen_name')}_raw_response_UserTweets_{datetime.now().isoformat().replace(':', '-').replace('.', '-')}.json")
+                    with open(raw_response_file, 'w', encoding='utf-8') as f:
+                        json.dump(timeline_data, f, indent=2)
+                    logger.log(f"Saved raw UserTweets response to {raw_response_file}")
+
+                    if len(tweets) < desired_tweet_target:
+                        bottom_cursor = find_bottom_cursor(timeline_data)
+                        if bottom_cursor:
+                            logger.log(f"Retrieved {len(tweets)} tweets; fetching next page with cursor for @{user.get('screen_name')}")
+                            next_page_response = await throttled_rapid_api_request(lambda: twitter_client.get_user_tweets(user_id, bottom_cursor))
+                            next_page_data = next_page_response.get('data')
+                            next_page_tweets = extract_tweets_from_response(next_page_data)
+                            logger.log(f"Retrieved {len(next_page_tweets)} additional tweets from paginated UserTweets call for @{user.get('screen_name')}")
+                            
+                            if next_page_tweets:
+                                tweets.extend(next_page_tweets)
+
+                            raw_response_file_cursor = os.path.join(RAW_RESPONSES_DIR, f"{user.get('screen_name')}_raw_response_UserTweets_cursor_{datetime.now().isoformat().replace(':', '-').replace('.', '-')}.json")
+                            with open(raw_response_file_cursor, 'w', encoding='utf-8') as f:
+                                json.dump(next_page_data, f, indent=2)
+                            logger.log(f"Saved paginated UserTweets response to {raw_response_file_cursor}")
                         else:
-                            logger.error(f"Error fetching tweets for @{user.get('screen_name')}: {error}")
-                            if error.response:
-                                logger.error(f"Status: {error.response.status_code}, Data: {error.response.text[:500]}...")
-                            error_count += 1
-                            return { "user": user, "status": 'error', "reason": 'api_error', "error": str(error) }
-                except Exception as error:
-                        logger.error(f"Error fetching tweets from UserTweets for @{user.get('screen_name')}: {error}")
+                            logger.log(f"No pagination cursor found in UserTweets response for @{user.get('screen_name')}")
+
+                except requests.exceptions.HTTPError as error:
+                    is_retryable_error = error.response and error.response.status_code in [500, 503, 504]
+                    if is_retryable_error:
+                        logger.warn(f"UserTweets endpoint failed with status {error.response.status_code}, retrying with UserTweetsAndReplies...")
+                    else:
+                        logger.error(f"Error fetching tweets for @{user.get('screen_name')}: {error}")
+                        if error.response:
+                            logger.error(f"Status: {error.response.status_code}, Data: {error.response.text[:500]}...")
                         error_count += 1
                         return { "user": user, "status": 'error', "reason": 'api_error', "error": str(error) }
+                except Exception as error:
+                    logger.error(f"Error fetching tweets from UserTweets for @{user.get('screen_name')}: {error}")
+                    error_count += 1
+                    return { "user": user, "status": 'error', "reason": 'api_error', "error": str(error) }
 
                 if not tweets or is_retryable_error:
                     logger.log(f"No tweets found or retryable error, trying UserTweetsAndReplies endpoint for @{user.get('screen_name')}")
                     await asyncio.sleep(0.5) # Smaller delay
                     
                     try:
-                        user_tweets_and_replies_params = {
-                            'id': user_id,
-                            'count': '5'
-                        }
-                        logger.log(f"UserTweetsAndReplies API call parameters: {json.dumps(user_tweets_and_replies_params)}")
+                        logger.log(f"UserTweetsAndReplies API call parameters: {{'user_id': '{user_id}'}}")
                         logger.log(f"User ID being used: {user_id} (type: {type(user_id)})")
                         
-                        timeline_response = await throttled_rapid_api_request(lambda: twitter_client.get_user_tweets_and_replies(user_id, '5'))
+                        timeline_response = await throttled_rapid_api_request(lambda: twitter_client.get_user_tweets_and_replies(user_id))
                         
                         logger.log(f"UserTweetsAndReplies API raw response status: {timeline_response.get('status')}")
                         logger.log(f"UserTweetsAndReplies API raw response headers: {json.dumps(timeline_response.get('headers'))}")
@@ -840,13 +880,32 @@ async def collect_tweets_for_new_followers(new_followings, source_username):
                             logger.error(f"Status code: {timeline_response['data'].get('statusCode') or timeline_response.get('status')}")
                             raise ValueError(f"API error: {timeline_response['data']['error']}")
                         
-                        tweets = extract_tweets_from_response(timeline_response['data'])
+                        timeline_data_replies = timeline_response.get('data')
+                        tweets = extract_tweets_from_response(timeline_data_replies)
                         logger.log(f"Retrieved {len(tweets)} tweets from UserTweetsAndReplies endpoint for @{user.get('screen_name')}")
 
                         raw_response_file = os.path.join(RAW_RESPONSES_DIR, f"{user.get('screen_name')}_raw_response_UserTweetsAndReplies_{datetime.now().isoformat().replace(':', '-').replace('.', '-')}.json")
                         with open(raw_response_file, 'w', encoding='utf-8') as f:
-                            json.dump(timeline_response['data'], f, indent=2)
+                            json.dump(timeline_data_replies, f, indent=2)
                         logger.log(f"Saved raw UserTweetsAndReplies response to {raw_response_file}")
+
+                        if len(tweets) < desired_tweet_target:
+                            bottom_cursor_replies = find_bottom_cursor(timeline_data_replies)
+                            if bottom_cursor_replies:
+                                logger.log(f"Retrieved {len(tweets)} tweets; fetching next page of UserTweetsAndReplies with cursor for @{user.get('screen_name')}")
+                                next_page_resp_replies = await throttled_rapid_api_request(lambda: twitter_client.get_user_tweets_and_replies(user_id, bottom_cursor_replies))
+                                next_page_data_replies = next_page_resp_replies.get('data')
+                                next_page_tweets_replies = extract_tweets_from_response(next_page_data_replies)
+                                logger.log(f"Retrieved {len(next_page_tweets_replies)} additional tweets from paginated UserTweetsAndReplies call for @{user.get('screen_name')}")
+                                if next_page_tweets_replies:
+                                    tweets.extend(next_page_tweets_replies)
+
+                                raw_response_file_cursor = os.path.join(RAW_RESPONSES_DIR, f"{user.get('screen_name')}_raw_response_UserTweetsAndReplies_cursor_{datetime.now().isoformat().replace(':', '-').replace('.', '-')}.json")
+                                with open(raw_response_file_cursor, 'w', encoding='utf-8') as f:
+                                    json.dump(next_page_data_replies, f, indent=2)
+                                logger.log(f"Saved paginated UserTweetsAndReplies response to {raw_response_file_cursor}")
+                            else:
+                                logger.log(f"No pagination cursor found in UserTweetsAndReplies response for @{user.get('screen_name')}")
 
                     except Exception as error:
                         logger.error(f"Error fetching tweets from UserTweetsAndReplies for @{user.get('screen_name')}: {error}")

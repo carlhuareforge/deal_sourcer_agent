@@ -130,13 +130,16 @@ class TwitterClient:
         }
 
     async def get_users_by_rest_ids(self, user_ids):
+        # New endpoint/host for batch user lookups
+        headers = dict(self.headers)
+        headers['x-rapidapi-host'] = 'twitter283.p.rapidapi.com'
         options = {
             'method': 'GET',
-            'url': 'https://twitter135.p.rapidapi.com/v2/UsersByRestIds/',
+            'url': 'https://twitter283.p.rapidapi.com/UserResultsByRestIds',
             'params': {
-                'ids': ','.join(user_ids)
+                'user_ids': ','.join(user_ids)
             },
-            'headers': self.headers
+            'headers': headers
         }
         return await throttled_rapid_api_request(lambda: make_http_request(options))
 
@@ -155,37 +158,45 @@ class TwitterClient:
         }
         return await throttled_rapid_api_request(lambda: make_http_request(options))
 
-    async def get_user_tweets(self, user_id, count):
+    async def get_user_tweets(self, user_id, cursor=None):
+        headers = dict(self.headers)
+        headers['x-rapidapi-host'] = 'twitter283.p.rapidapi.com'
         options = {
             'method': 'GET',
-            'url': 'https://twitter135.p.rapidapi.com/v2/UserTweets/',
+            'url': 'https://twitter283.p.rapidapi.com/UserTweets',
             'params': {
-                'id': user_id,
-                'count': str(count)
+                'user_id': user_id
             },
-            'headers': self.headers
+            'headers': headers
         }
+        if cursor:
+            options['params']['cursor'] = cursor
         return await throttled_rapid_api_request(lambda: make_http_request(options))
 
-    async def get_user_tweets_and_replies(self, user_id, count):
+    async def get_user_tweets_and_replies(self, user_id, cursor=None):
+        headers = dict(self.headers)
+        headers['x-rapidapi-host'] = 'twitter283.p.rapidapi.com'
         options = {
             'method': 'GET',
-            'url': 'https://twitter135.p.rapidapi.com/v2/UserTweetsAndReplies/',
+            'url': 'https://twitter283.p.rapidapi.com/UserTweetsReplies',
             'params': {
-                'id': user_id,
-                'count': str(count)
+                'user_id': user_id
             },
-            'headers': self.headers
+            'headers': headers
         }
+        if cursor:
+            options['params']['cursor'] = cursor
         return await throttled_rapid_api_request(lambda: make_http_request(options))
 
     async def get_user_by_screen_name(self, screen_name):
+        headers = dict(self.headers)
+        headers['x-rapidapi-host'] = 'twitter283.p.rapidapi.com'
         options = {
             'method': 'GET',
-            'url': 'https://twitter135.p.rapidapi.com/v2/UserByScreenName/',
+            'url': 'https://twitter283.p.rapidapi.com/UserResultByScreenName',
             'params': {
                 'username': screen_name
             },
-            'headers': self.headers
+            'headers': headers
         }
         return await throttled_rapid_api_request(lambda: make_http_request(options))
