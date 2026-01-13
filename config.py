@@ -73,3 +73,10 @@ USE_S3_SYNC = os.getenv('USE_S3_SYNC', 'True').lower() == 'true'
 S3_BUCKET = os.getenv('S3_BUCKET', '')
 S3_DB_KEY = os.getenv('S3_DB_KEY', 'twitter_profiles.db')
 S3_REGION = os.getenv('S3_REGION', 'us-east-1')
+
+# S3 run artifact uploads (logs + AI input/response bundles)
+S3_UPLOAD_LOGS = os.getenv('S3_UPLOAD_LOGS', 'True').lower() == 'true'
+S3_LOGS_PREFIX = os.getenv('S3_LOGS_PREFIX', 'run-logs')
+
+S3_UPLOAD_AI_TWEETS_ZIP = os.getenv('S3_UPLOAD_AI_TWEETS_ZIP', 'True').lower() == 'true'
+S3_AI_TWEETS_ZIP_PREFIX = os.getenv('S3_AI_TWEETS_ZIP_PREFIX', 'tweet_ai_log')

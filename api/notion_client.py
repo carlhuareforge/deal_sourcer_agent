@@ -40,17 +40,6 @@ class NotionClient:
                     "start": entry_data.get('date', '')
                 }
             },
-            "Details": {
-                "type": "rich_text",
-                "rich_text": [
-                    {
-                        "type": "text",
-                        "text": {
-                            "content": entry_data.get('content', '')[:1990]  # Limit to 1990 chars like app.js
-                        }
-                    }
-                ]
-            },
             "Source": {
                 "type": "rich_text",
                 "rich_text": [
@@ -260,18 +249,18 @@ class NotionClient:
             logger.error(f"An unexpected error occurred while updating Notion entry: {e}")
             raise
 
-    async def update_notion_date_and_recheck_for_pivot(self, page_id, date_value):
+    async def update_notion_date_and_recheck(self, page_id, date_value):
         if not NOTION_UPLOAD_ENABLED:
-            logger.log("Notion upload is disabled. Skipping recheck for pivot update.")
+            logger.log("Notion upload is disabled. Skipping recheck update.")
             return {"id": page_id or "mock_notion_page_id", "status": "mock_success"}
         if not page_id:
             raise ValueError("Notion page_id is required for update.")
 
-        logger.log(f"Updating Notion Date + Research Status for recheck for pivot: {page_id}")
+        logger.log(f"Updating Notion Date + Research Status for recheck: {page_id}")
         data = {
             "properties": {
                 "Date": {"date": {"start": date_value}},
-                "Research Status": {"multi_select": [{"name": "recheck for pivot"}]},
+                "Research Status": {"multi_select": [{"name": "recheck"}]},
                 "Research Date": {"date": None},
                 "Ava's Priority": {"select": None},
             }
@@ -281,7 +270,7 @@ class NotionClient:
             response = requests.patch(f"{self.base_url}/pages/{page_id}", headers=self.headers, json=data)
 
             if response.status_code != 200:
-                logger.error(f"Notion API returned status {response.status_code} on recheck for pivot update")
+                logger.error(f"Notion API returned status {response.status_code} on recheck update")
                 logger.error(f"Response headers: {dict(response.headers)}")
                 logger.error(f"Response text: {response.text}")
                 try:
@@ -294,7 +283,7 @@ class NotionClient:
             logger.log(f"Successfully updated Notion Date + Research Status for {page_id}")
             return response.json()
         except requests.exceptions.RequestException as e:
-            logger.error(f"Error updating Notion recheck for pivot for {page_id}: {e}")
+            logger.error(f"Error updating Notion recheck for {page_id}: {e}")
             if hasattr(e, 'response') and e.response is not None:
                 try:
                     error_text = e.response.text
@@ -305,7 +294,7 @@ class NotionClient:
                     logger.error(f"Could not parse error response: {parse_error}")
             raise
         except Exception as e:
-            logger.error(f"An unexpected error occurred while updating Notion recheck for pivot: {e}")
+            logger.error(f"An unexpected error occurred while updating Notion recheck: {e}")
             raise
 
 # Initialize a global Notion client instance
@@ -316,4 +305,4 @@ initialize_notion_categories = notion_client.initialize_notion_categories
 get_existing_categories = notion_client.get_existing_categories
 add_notion_database_entry = notion_client.add_notion_database_entry
 update_notion_database_entry = notion_client.update_notion_database_entry
-update_notion_date_and_recheck_for_pivot = notion_client.update_notion_date_and_recheck_for_pivot
+update_notion_date_and_recheck = notion_client.update_notion_date_and_recheck

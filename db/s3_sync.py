@@ -1,10 +1,22 @@
 import os
 import sqlite3
+import tempfile
+import zipfile
 from datetime import datetime
 import boto3
 from botocore.exceptions import ClientError, NoCredentialsError
 from utils.logger import logger
-from config import S3_BUCKET, S3_DB_KEY, S3_REGION, DB_DIR, USE_S3_SYNC
+from config import (
+    DB_DIR,
+    S3_AI_TWEETS_ZIP_PREFIX,
+    S3_BUCKET,
+    S3_DB_KEY,
+    S3_LOGS_PREFIX,
+    S3_REGION,
+    S3_UPLOAD_AI_TWEETS_ZIP,
+    S3_UPLOAD_LOGS,
+    USE_S3_SYNC,
+)
 
 class S3DatabaseSync:
     def __init__(self):
@@ -423,3 +435,119 @@ class S3DatabaseSync:
         except Exception as e:
             logger.error(f"Failed to list S3 versions: {e}")
             return []
+
+    @staticmethod
+    def _normalize_prefix(prefix_value):
+        if prefix_value is None:
+            return ""
+        normalized = str(prefix_value).strip().lstrip("/")
+        return normalized.rstrip("/")
+
+    @staticmethod
+    def _directory_has_files(directory_path):
+        for _, _, files in os.walk(directory_path):
+            if files:
+                return True
+        return False
+
+    @staticmethod
+    def _zip_directory(source_dir, zip_path):
+        folder_name = os.path.basename(os.path.abspath(source_dir)) or "ai_tweets"
+        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for root, _, files in os.walk(source_dir):
+                for filename in files:
+                    full_path = os.path.join(root, filename)
+                    rel_path = os.path.relpath(full_path, start=source_dir)
+                    arcname = os.path.join(folder_name, rel_path)
+                    zf.write(full_path, arcname=arcname)
+
+    async def upload_log_file(self, log_file_path):
+        """Upload a local run log file (app_*.log) to S3."""
+        if not USE_S3_SYNC or not S3_UPLOAD_LOGS:
+            return
+
+        if not log_file_path:
+            logger.log("No log file path provided; skipping log upload.")
+            return
+
+        if not os.path.exists(log_file_path):
+            logger.log(f"Log file not found: {log_file_path}. Skipping upload.")
+            return
+
+        prefix = self._normalize_prefix(S3_LOGS_PREFIX)
+        filename = os.path.basename(log_file_path)
+        s3_key = f"{prefix}/{filename}" if prefix else filename
+
+        try:
+            logger.log(f"📤 Uploading run log to S3: s3://{self.bucket}/{s3_key}")
+            self.s3.upload_file(
+                log_file_path,
+                self.bucket,
+                s3_key,
+                ExtraArgs={
+                    "ContentType": "text/plain",
+                    "Metadata": {
+                        "uploaded-by": os.environ.get("USER", "unknown"),
+                        "source-machine": os.environ.get("HOSTNAME", os.environ.get("COMPUTERNAME", "unknown")),
+                        "upload-time": datetime.now().isoformat(),
+                    },
+                },
+            )
+            logger.log(f"✅ Uploaded run log: {filename}")
+        except Exception as e:
+            logger.error(f"Failed to upload run log to S3: {e}")
+            raise
+
+    async def upload_ai_tweets_zip(self, ai_tweets_dir, run_id=None):
+        """Zip the ai_tweets directory and upload it to S3 as a single archive."""
+        if not USE_S3_SYNC or not S3_UPLOAD_AI_TWEETS_ZIP:
+            return
+
+        if not ai_tweets_dir or not os.path.isdir(ai_tweets_dir):
+            logger.log("No ai_tweets directory found; skipping AI tweets archive upload.")
+            return
+
+        if not self._directory_has_files(ai_tweets_dir):
+            logger.log("ai_tweets directory is empty; skipping AI tweets archive upload.")
+            return
+
+        prefix = self._normalize_prefix(S3_AI_TWEETS_ZIP_PREFIX)
+        timestamp = run_id or datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        zip_filename = f"{timestamp}.zip"
+        s3_key = f"{prefix}/{zip_filename}" if prefix else zip_filename
+
+        tmp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(prefix="ai_tweets_", suffix=".zip", delete=False) as tmp:
+                tmp_path = tmp.name
+
+            self._zip_directory(ai_tweets_dir, tmp_path)
+
+            size_mb = os.path.getsize(tmp_path) / 1024 / 1024
+            logger.log(f"📦 Created AI tweets archive: {zip_filename} ({size_mb:.2f} MB)")
+            logger.log(f"📤 Uploading AI tweets archive to S3: s3://{self.bucket}/{s3_key}")
+
+            self.s3.upload_file(
+                tmp_path,
+                self.bucket,
+                s3_key,
+                ExtraArgs={
+                    "ContentType": "application/zip",
+                    "Metadata": {
+                        "uploaded-by": os.environ.get("USER", "unknown"),
+                        "source-machine": os.environ.get("HOSTNAME", os.environ.get("COMPUTERNAME", "unknown")),
+                        "upload-time": datetime.now().isoformat(),
+                        "run-id": str(timestamp),
+                    },
+                },
+            )
+            logger.log(f"✅ Uploaded AI tweets archive: {zip_filename}")
+        except Exception as e:
+            logger.error(f"Failed to upload AI tweets archive to S3: {e}")
+            raise
+        finally:
+            if tmp_path:
+                try:
+                    os.remove(tmp_path)
+                except Exception as cleanup_error:
+                    logger.debug(f"Could not delete temp AI tweets zip {tmp_path}: {cleanup_error}")

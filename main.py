@@ -29,7 +29,7 @@ from api.notion_client import (
     initialize_notion_categories,
     add_notion_database_entry,
     update_notion_database_entry,
-    update_notion_date_and_recheck_for_pivot,
+    update_notion_date_and_recheck,
 )
 from api.openai_client import get_openai_client, create_throttler
 from services.deduplication_service import DeduplicationService
@@ -428,7 +428,6 @@ async def analyze_tweets_with_ai(tweets_file_path, custom_throttler=None):
             "name": parsed_data.get('name', 'Unknown'),
             "summary": parsed_data.get('summary', ''),
             "date": datetime.now(pytz.timezone('America/New_York')).strftime('%Y-%m-%d'),
-            "content": parsed_data.get('content', ''),
             "screenName": screen_name,
             "sourceUsername": simplified_data['sourceUsername'],
             "categories": final_cats
@@ -466,26 +465,26 @@ async def analyze_tweets_with_ai(tweets_file_path, custom_throttler=None):
             if existing_page_id:
                 min_account_age_days_for_recheck = 365
                 recheck_after_days = 90
-                should_recheck_for_pivot = (
+                should_recheck = (
                     days_since_last_update is not None
                     and days_since_last_update >= recheck_after_days
                     and account_age_days is not None
                     and account_age_days >= min_account_age_days_for_recheck
                 )
-                if should_recheck_for_pivot:
+                if should_recheck:
                     logger.log(
                         f"Updating stale Notion page for @{screen_name} "
                         f"({days_since_last_update} days, account age {account_age_days} days) "
                         f"with Date + Research Status: {existing_page_id}"
                     )
-                    notion_response = await update_notion_date_and_recheck_for_pivot(existing_page_id, notion_entry["date"])
+                    notion_response = await update_notion_date_and_recheck(existing_page_id, notion_entry["date"])
                     stale_notion_updates.append({
                         "username": screen_name,
                         "sourceUsername": simplified_data['sourceUsername'],
                         "notionPageId": existing_page_id,
                         "daysSinceLastUpdate": days_since_last_update,
                         "previousLastUpdatedDate": last_updated_raw,
-                        "action": "set_date_and_research_status_recheck_for_pivot",
+                        "action": "set_date_and_research_status_recheck",
                         "recheckAfterDays": recheck_after_days,
                         "accountAgeDays": account_age_days,
                     })
@@ -1568,20 +1567,42 @@ async def main():
         logger.log(f"Skip Rate: {skip_rate:.1f}%")
     logger.log(f"───────────────────────────────────────\n")
     
-    # Upload updated database and follower counts to S3 if enabled and run completed successfully
+    # Upload updated database and follower counts to S3 if enabled (best-effort)
     if USE_S3_SYNC and s3_sync:
         try:
             logger.log("🔄 Uploading updated database to S3...")
             await s3_sync.upload_changes()
             logger.log("✅ Database successfully synced to S3")
-            
-            # Also sync the newest follower counts file
+        except Exception as e:
+            logger.error(f"Failed to upload database to S3: {e}")
+
+        try:
             logger.log("🔄 Syncing follower counts to S3...")
             await s3_sync.sync_follower_counts()
             logger.log("✅ Follower counts synced to S3")
         except Exception as e:
-            logger.error(f"Failed to upload to S3: {e}")
-            # Don't fail the entire run if S3 upload fails
+            logger.error(f"Failed to sync follower counts to S3: {e}")
+
+        try:
+            run_log_file = getattr(logger, "log_file", None)
+            run_id = None
+            if run_log_file:
+                base_name = os.path.basename(run_log_file)
+                if base_name.startswith("app_") and base_name.endswith(".log"):
+                    run_id = base_name[len("app_") : -len(".log")]
+
+            # Flush logs before uploading the log file
+            for handler in logging.getLogger().handlers:
+                try:
+                    handler.flush()
+                except Exception:
+                    pass
+
+            if run_log_file:
+                await s3_sync.upload_log_file(run_log_file)
+            await s3_sync.upload_ai_tweets_zip(AI_TWEETS_DIR, run_id=run_id)
+        except Exception as artifact_error:
+            logger.error(f"Failed to upload run artifacts to S3: {artifact_error}")
     
     profile_skips = sum(
         count for reason, count in triage_skip_counts.items() if reason.strip().lower() == "profile"

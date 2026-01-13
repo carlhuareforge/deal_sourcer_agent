@@ -24,13 +24,16 @@ TASK
 Decide whether the account is a Project (a core product/protocol/company account), a Profile (my definition below) or Meme
 Then return EXACTLY ONE valid JSON object (raw JSON only) matching the schema below. No markdown, no code fences, no extra text.
 
-```json
 {
   "name": "STRING",
-  "categories": ["PENDING"], ["Meme"] or ["PROFILE"],
-  "summary": "A short, high-level summary of what the project is about and what they do. Must not exceed 1900 characters.",
-  "content": "More in-depth details and bullet points. Summarizing what the project is, include notable URLs and twitter contents/hdnels. Target ~180 words"
+  "categories": ["Pending"],
+  "summary": "STRING"
 }
+
+Rules:
+- categories must be exactly one of: ["Pending"], ["Meme"], ["Profile"]
+- If categories is ["Meme"] or ["Profile"], set summary = "" (empty string)
+- If categories is ["Pending"], summary must not exceed 1900 characters.
 
 INSTRUCTIONS
 ──────────────────────────────────────────────────────────────────────────────
@@ -48,14 +51,14 @@ If ANY of the following are true, you MUST output exactly one tag:
 Then set:
 - categories = ["Meme"]
 
-And STOP, DO NOT populate summary or content field, return requested JSON:
+And STOP. Set summary = "" (empty string) and return the requested JSON.
 
 ──────────────────────────────────────────────────────────────────────────────
 STEP 2 — PROFILE VS PROJECT GATE
 
 If it is NOT a Meme, decide whether it is a real project/protocol/company (taggable) or a non-project account.
 
-If ANY of these are true, set categories = ["Profile"] and STOP, DO NOT populate summary or content field, return requested JSON:
+If ANY of these are true, set categories = ["Profile"] and STOP. Set summary = "" (empty string) and return the requested JSON.
 
    A. **INDIVIDUAL PERSON/ AI Agent/DAO** - Set `categories = ["Profile"]` if ANY of these are true:
       - The profile represents a human being or AI Agent (not a company, project, or protocol)
@@ -117,7 +120,7 @@ Otherwise, treat it as a PROJECT/COMPANY/PROTOCOL and proceed to STEP 4.
 ──────────────────────────────────────────────────────────────────────────────
 STEP 4
 
-Set categories = ["Pending"] and populate summary and content field, return requested JSON
+Set categories = ["Pending"] and populate the summary field, return requested JSON
 ──────────────────────────────────────────────────────────────────────────────
 
 
