@@ -10,6 +10,14 @@ class Repository:
         self.db_path = os.path.join(DB_DIR, db_name)
         self._initialized = False
 
+    @staticmethod
+    def _normalize_handle(value):
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            return str(value).strip().lstrip("@").lower()
+        return value.strip().lstrip("@").lower()
+
     def _ensure_initialized(self):
         """Ensure database is initialized before any operation"""
         if not self._initialized:
@@ -96,6 +104,8 @@ class Repository:
         Uses the two-table structure: processed_profiles and source_relationships
         """
         self._ensure_initialized()
+        twitter_handle = self._normalize_handle(twitter_handle)
+        source_username = self._normalize_handle(source_username)
         conn = None
         try:
             conn = sqlite3.connect(self.db_path)
@@ -105,23 +115,38 @@ class Repository:
             now = datetime.now().isoformat()
             
             # Check if profile already exists
-            cursor.execute("SELECT twitter_handle, category FROM processed_profiles WHERE twitter_handle = ?", (twitter_handle,))
+            cursor.execute(
+                """
+                SELECT twitter_handle, category
+                FROM processed_profiles
+                WHERE twitter_handle = ? COLLATE NOCASE
+                ORDER BY
+                    (notion_page_id IS NOT NULL) DESC,
+                    first_discovered_date ASC,
+                    last_updated_date DESC,
+                    rowid DESC
+                LIMIT 1
+                """,
+                (twitter_handle,),
+            )
             existing = cursor.fetchone()
             
+            canonical_handle = twitter_handle
             if existing:
+                canonical_handle = existing[0]
                 # Update existing profile
                 if notion_page_id is None:
                     cursor.execute("""
                         UPDATE processed_profiles
                         SET last_updated_date = ?, category = COALESCE(?, category)
                         WHERE twitter_handle = ?
-                    """, (now, category, twitter_handle))
+                    """, (now, category, canonical_handle))
                 else:
                     cursor.execute("""
                         UPDATE processed_profiles 
                         SET last_updated_date = ?, notion_page_id = ?, category = COALESCE(?, category)
                         WHERE twitter_handle = ?
-                    """, (now, notion_page_id, category, twitter_handle))
+                    """, (now, notion_page_id, category, canonical_handle))
             else:
                 # Insert new profile
                 cursor.execute("""
@@ -135,7 +160,7 @@ class Repository:
                 INSERT OR IGNORE INTO source_relationships 
                 (twitter_handle, discovered_by_handle, discovery_date)
                 VALUES (?, ?, ?)
-            """, (twitter_handle, source_username, now))
+            """, (canonical_handle, source_username, now))
             
             conn.commit()
             logger.debug(f"Recorded/updated profile {twitter_handle} for source {source_username}")
@@ -150,12 +175,14 @@ class Repository:
         """
         Gets a processed profile checking both the profile and source relationship
         """
+        twitter_handle = self._normalize_handle(twitter_handle)
+        source_username = self._normalize_handle(source_username)
         # No need for _ensure_initialized() here since _execute_query calls it
         query = """
         SELECT p.twitter_handle, p.notion_page_id, p.last_updated_date
         FROM processed_profiles p
         INNER JOIN source_relationships sr ON p.twitter_handle = sr.twitter_handle
-        WHERE p.twitter_handle = ? AND sr.discovered_by_handle = ?
+        WHERE p.twitter_handle = ? COLLATE NOCASE AND sr.discovered_by_handle = ? COLLATE NOCASE
         """
         try:
             result = self._execute_query(query, (twitter_handle, source_username), fetch_one=True)
@@ -172,7 +199,18 @@ class Repository:
         """
         Find a profile by Twitter handle (globally, like JavaScript)
         """
-        query = "SELECT * FROM processed_profiles WHERE twitter_handle = ?"
+        twitter_handle = self._normalize_handle(twitter_handle)
+        query = """
+        SELECT *
+        FROM processed_profiles
+        WHERE twitter_handle = ? COLLATE NOCASE
+        ORDER BY
+            (notion_page_id IS NOT NULL) DESC,
+            first_discovered_date ASC,
+            last_updated_date DESC,
+            rowid DESC
+        LIMIT 1
+        """
         try:
             result = self._execute_query(query, (twitter_handle,), fetch_one=True)
             if result:
@@ -193,8 +231,9 @@ class Repository:
         """
         Update the last_updated_date for a profile
         """
+        twitter_handle = self._normalize_handle(twitter_handle)
         now = datetime.now().isoformat()
-        query = "UPDATE processed_profiles SET last_updated_date = ? WHERE twitter_handle = ?"
+        query = "UPDATE processed_profiles SET last_updated_date = ? WHERE twitter_handle = ? COLLATE NOCASE"
         try:
             self._execute_query(query, (now, twitter_handle))
         except Exception as e:
@@ -204,6 +243,8 @@ class Repository:
         """
         Add a new source relationship (or ignore if already exists)
         """
+        twitter_handle = self._normalize_handle(twitter_handle)
+        source_username = self._normalize_handle(source_username)
         now = datetime.now().isoformat()
         query = """
         INSERT OR IGNORE INTO source_relationships 
@@ -219,10 +260,11 @@ class Repository:
         """
         Get all sources that discovered this profile
         """
+        twitter_handle = self._normalize_handle(twitter_handle)
         query = """
         SELECT discovered_by_handle, discovery_date 
         FROM source_relationships 
-        WHERE twitter_handle = ?
+        WHERE twitter_handle = ? COLLATE NOCASE
         ORDER BY discovery_date
         """
         try:

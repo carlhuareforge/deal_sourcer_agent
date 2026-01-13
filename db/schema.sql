@@ -3,7 +3,7 @@ PRAGMA foreign_keys = ON;
 
 -- Profiles table
 CREATE TABLE IF NOT EXISTS processed_profiles (
-    twitter_handle TEXT PRIMARY KEY,
+    twitter_handle TEXT PRIMARY KEY COLLATE NOCASE,
     first_discovered_date TEXT NOT NULL,
     last_updated_date TEXT NOT NULL,
     notion_page_id TEXT,
@@ -13,8 +13,8 @@ CREATE TABLE IF NOT EXISTS processed_profiles (
 
 -- Source relationships table
 CREATE TABLE IF NOT EXISTS source_relationships (
-    twitter_handle TEXT,
-    discovered_by_handle TEXT,
+    twitter_handle TEXT COLLATE NOCASE,
+    discovered_by_handle TEXT COLLATE NOCASE,
     discovery_date TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (twitter_handle, discovered_by_handle),
