@@ -86,6 +86,7 @@ If ANY of these are true, set categories = ["Profile"] and STOP. Set summary = "
       - The account mainly reposts/translates content from a main account
 
    D. **ADDITIONAL EXCLUSION CRITERIA** - Also set `categories = ["Profile"]` for:
+      - Any sort of bots - crypto trading bots, AI bots or other bots that provide automated service
       - Ovbiously not related to blockchain, AI, Robotics, tech compaines.
       - Political orgranizations
       - Educational content creators, influencers, or KOLs (Key Opinion Leaders)
